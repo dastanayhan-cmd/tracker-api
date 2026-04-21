@@ -10,9 +10,10 @@ app.use(express.json());
 const port = process.env.PORT || 3000;
 
 let sockInstance = null;
+let globalQR = ''; // Karekodu tutacağımız değişken
 
 // --------------------------------------------------------
-// 1. VERİTABANI (Profil Fotoğrafı Sütunu Eklendi)
+// 1. VERİTABANI
 // --------------------------------------------------------
 const db = new sqlite3.Database('./tracker.db', (err) => {
     if (err) console.error("Veritabanı hatası:", err.message);
@@ -40,16 +41,23 @@ async function connectToWhatsApp() {
     sock.ev.on('creds.update', saveCreds);
 
     sock.ev.on('connection.update', (update) => {
-        const { connection, lastDisconnect } = update;
+        const { connection, lastDisconnect, qr } = update;
         
+        if (qr) {
+            globalQR = qr; // API için karekodu yakala
+        }
+
         if (connection === 'close') {
             const shouldReconnect = (lastDisconnect.error)?.output?.statusCode !== DisconnectReason.loggedOut;
             if (shouldReconnect) {
                 setTimeout(connectToWhatsApp, 3000);
+            } else {
+                globalQR = '';
             }
         } else if (connection === 'open') {
             console.log("WhatsApp API bağlandı! 🟢");
-            // Uyanınca kayıtlı numaraları tekrar radara al
+            globalQR = ''; // Bağlanınca karekodu temizle
+            
             db.all("SELECT number FROM targets", [], (err, rows) => {
                 if (rows) {
                     rows.forEach(async (row) => {
@@ -84,16 +92,18 @@ async function connectToWhatsApp() {
 connectToWhatsApp();
 
 // --------------------------------------------------------
-// 3. API UÇ NOKTALARI (Android ve Web Arayüzü İçin)
+// 3. API UÇ NOKTALARI
 // --------------------------------------------------------
-
-// Bot durumunu kontrol eder
 app.get('/api/status', (req, res) => {
     const isRegistered = sockInstance?.authState?.creds?.registered || false;
     res.json({ registered: isRegistered });
 });
 
-// Eşleştirme Kodu Verir
+// Yeni: Karekod İsteme Noktası
+app.get('/api/qr', (req, res) => {
+    res.json({ qr: globalQR });
+});
+
 app.get('/api/pair', async (req, res) => {
     const phone = req.query.phone;
     if (!phone) return res.json({ success: false, message: "Numara eksik" });
@@ -104,33 +114,28 @@ app.get('/api/pair', async (req, res) => {
             let formattedCode = code?.match(/.{1,4}/g)?.join('-') || code;
             res.json({ success: true, code: formattedCode });
         } catch (error) {
-            res.json({ success: false, message: "Kod alınamadı." });
+            res.json({ success: false, message: "WhatsApp Sunucuları bulut IP'mizi reddetti. Lütfen aşağıdaki Karekod (QR) yöntemini kullanın." });
         }
     } else {
         res.json({ success: false, message: "Zaten bağlı veya hazır değil." });
     }
 });
 
-// Kayıtlı Numaraları Profil Fotoğraflarıyla Getirir
 app.get('/api/targets', (req, res) => {
     db.all("SELECT * FROM targets", [], (err, rows) => {
         res.json(rows || []);
     });
 });
 
-// Yeni Numara Ekler (Profil Fotoğrafını Çekmeye Çalışır)
 app.post('/api/add-target', async (req, res) => {
     const { number, name } = req.body;
-    let picUrl = 'https://cdn.pixabay.com/photo/2015/10/05/22/37/blank-profile-picture-973460_960_720.png'; // Varsayılan Boş Resim
+    let picUrl = 'https://cdn.pixabay.com/photo/2015/10/05/22/37/blank-profile-picture-973460_960_720.png'; 
     
     if (sockInstance) {
         try {
-            // WhatsApp sunucularından karşı tarafın profil fotoğrafını çek!
             const fetchedUrl = await sockInstance.profilePictureUrl(number + '@s.whatsapp.net', 'image');
             if(fetchedUrl) picUrl = fetchedUrl;
-        } catch (e) {
-            console.log("Profil fotoğrafı gizli veya yok.");
-        }
+        } catch (e) {}
     }
 
     db.run("INSERT OR REPLACE INTO targets (number, name, pic_url) VALUES (?, ?, ?)", [number, name, picUrl], async (err) => {
@@ -143,9 +148,7 @@ app.post('/api/add-target', async (req, res) => {
     });
 });
 
-// Logları Getirir
 app.get('/api/logs', (req, res) => {
-    // Logları isimlerle birleştirip getir
     const query = `
         SELECT logs.*, targets.name, targets.pic_url 
         FROM logs 
@@ -158,7 +161,7 @@ app.get('/api/logs', (req, res) => {
 });
 
 // --------------------------------------------------------
-// 4. MOBİL UYUMLU PROFESYONEL WEB ARAYÜZÜ (FRONTEND)
+// 4. WEB ARAYÜZÜ (Karekod Entegreli)
 // --------------------------------------------------------
 app.get('/', (req, res) => {
     res.send(`
@@ -168,6 +171,7 @@ app.get('/', (req, res) => {
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>WhatsLives Panel</title>
+    <script src="https://cdn.jsdelivr.net/npm/qrcode/build/qrcode.min.js"></script>
     <style>
         body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f0f2f5; margin: 0; padding: 0; }
         .app-container { max-width: 500px; margin: 0 auto; background: white; min-height: 100vh; box-shadow: 0 0 10px rgba(0,0,0,0.1); }
@@ -177,12 +181,10 @@ app.get('/', (req, res) => {
         input { width: 100%; padding: 12px; margin: 8px 0; border: 1px solid #ccc; border-radius: 5px; box-sizing: border-box; }
         button { width: 100%; background-color: #25D366; color: white; padding: 14px; margin: 8px 0; border: none; border-radius: 5px; font-weight: bold; cursor: pointer; }
         .code-display { font-size: 32px; font-weight: bold; color: #075E54; text-align: center; letter-spacing: 5px; margin: 20px 0; background: #e9edef; padding: 15px; border-radius: 8px;}
-        
         .target-card { display: flex; align-items: center; background: #f8f9fa; padding: 10px; margin-bottom: 10px; border-radius: 8px; border: 1px solid #eee; }
         .target-card img { width: 50px; height: 50px; border-radius: 50%; object-fit: cover; margin-right: 15px; border: 2px solid #25D366; }
         .target-info h4 { margin: 0 0 5px 0; color: #333; }
         .target-info p { margin: 0; font-size: 12px; color: #666; }
-        
         .log-item { background: white; padding: 12px; border-bottom: 1px solid #eee; display: flex; align-items: center; }
         .log-item img { width: 40px; height: 40px; border-radius: 50%; margin-right: 15px; }
         .log-time { font-size: 11px; color: #888; margin-top: 4px; }
@@ -197,14 +199,23 @@ app.get('/', (req, res) => {
 
     <div id="loginSection" class="section">
         <h3 style="text-align:center; color:#075E54;">Sistemi Başlat</h3>
-        <p style="font-size:14px; color:#666; text-align:center;">Botun çalışacağı numarayı girin.</p>
+        <p style="font-size:14px; color:#666; text-align:center;">WhatsApp engelini aşmak için Karekod yöntemini kullanın.</p>
+        
+        <div id="qrContainer" style="text-align: center; margin: 20px 0; padding: 20px; background: #fafafa; border-radius: 10px; border: 1px dashed #ccc;">
+            <p id="qrText">Karekod Bekleniyor...</p>
+            <canvas id="qrCanvas" style="display:none; margin: 0 auto;"></canvas>
+            <p style="font-size:12px; color:#777;">Bu görüntüyü başka bir ekrana atıp WhatsApp > Bağlı Cihazlar'dan okutun.</p>
+        </div>
+
+        <hr style="border:0; border-top:1px solid #eee; margin:20px 0;">
+        
+        <p style="font-size:14px; color:#666; text-align:center;">Veya şansınızı SMS kodu ile deneyin:</p>
         <input type="text" id="botNumber" placeholder="Örn: 905321234567">
         <button onclick="getCode()">Eşleştirme Kodu Al</button>
         <div id="codeResult"></div>
     </div>
 
     <div id="dashboardSection" class="section">
-        
         <div style="background:#e9edef; padding:15px; border-radius:8px; margin-bottom:20px;">
             <h4 style="margin-top:0;">Yeni Hedef Ekle</h4>
             <input type="text" id="targetName" placeholder="Kişi Adı (Örn: Yağmur)">
@@ -214,19 +225,15 @@ app.get('/', (req, res) => {
 
         <h3>Radardaki Kişiler</h3>
         <div id="targetsList">Yükleniyor...</div>
-
         <hr style="border:0; border-top:1px solid #ddd; margin:20px 0;">
-
         <h3>Canlı Hareketler</h3>
         <div id="logsList" style="background:#fafafa; border-radius:8px; border:1px solid #eee; max-height:400px; overflow-y:auto;">
             Yükleniyor...
         </div>
-
     </div>
 </div>
 
 <script>
-    // Sayfa açıldığında botun durumunu kontrol et
     async function checkStatus() {
         const res = await fetch('/api/status');
         const data = await res.json();
@@ -236,13 +243,30 @@ app.get('/', (req, res) => {
             document.getElementById('dashboardSection').classList.add('active-section');
             loadTargets();
             loadLogs();
-            setInterval(loadLogs, 10000); // Her 10 saniyede bir logları yenile
+            setInterval(loadLogs, 10000); 
         } else {
             document.getElementById('loginSection').classList.add('active-section');
         }
     }
 
-    // Kod İsteme API Çağrısı
+    async function checkQR() {
+        const res = await fetch('/api/qr');
+        const data = await res.json();
+        const canvas = document.getElementById('qrCanvas');
+        const text = document.getElementById('qrText');
+
+        if (data.qr) {
+            text.style.display = 'none';
+            canvas.style.display = 'block';
+            QRCode.toCanvas(canvas, data.qr, { width: 200 }, function (error) {
+                if (error) console.error(error);
+            });
+        } else {
+            text.style.display = 'block';
+            canvas.style.display = 'none';
+        }
+    }
+
     async function getCode() {
         const num = document.getElementById('botNumber').value;
         if(!num) return alert("Numara girin!");
@@ -253,21 +277,18 @@ app.get('/', (req, res) => {
         
         if(data.success) {
             document.getElementById('codeResult').innerHTML = '<div class="code-display">' + data.code + '</div><p style="text-align:center;">WhatsApp > Bağlı Cihazlar kısmına girin.</p>';
-            // Kodu aldıktan sonra sürekli durumu kontrol et, bağlandığında paneli aç
-            setInterval(() => { location.reload(); }, 5000);
         } else {
             alert(data.message);
         }
     }
 
-    // Hedef Ekleme API Çağrısı
     async function addTarget() {
         const name = document.getElementById('targetName').value;
         const number = document.getElementById('targetNumber').value;
         if(!name || !number) return alert("Bilgileri doldurun!");
 
         const btn = event.target;
-        btn.innerText = "Ekleniyor...";
+        btn.innerText = "Ekleniyor (Profil Fotoğrafı Çekiliyor)...";
 
         const res = await fetch('/api/add-target', {
             method: 'POST',
@@ -284,7 +305,6 @@ app.get('/', (req, res) => {
         }
     }
 
-    // Hedefleri Çekme
     async function loadTargets() {
         const res = await fetch('/api/targets');
         const targets = await res.json();
@@ -303,7 +323,6 @@ app.get('/', (req, res) => {
         document.getElementById('targetsList').innerHTML = html || '<p>Henüz takip edilen kimse yok.</p>';
     }
 
-    // Logları Çekme
     async function loadLogs() {
         const res = await fetch('/api/logs');
         const logs = await res.json();
@@ -329,6 +348,8 @@ app.get('/', (req, res) => {
     }
 
     checkStatus();
+    setInterval(checkStatus, 5000); // Sistem bağlandı mı diye sürekli kontrol et
+    setInterval(checkQR, 3000); // QR kodunu sürekli canlı tut
 </script>
 
 </body>
@@ -339,3 +360,4 @@ app.get('/', (req, res) => {
 app.listen(port, () => {
     console.log("Sunucu " + port + " portunda hazır.");
 });
+                   
