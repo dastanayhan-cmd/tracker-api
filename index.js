@@ -1,9 +1,8 @@
 const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, Browsers } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
 const sqlite3 = require('sqlite3').verbose();
-const qrcode = require('qrcode');
 const pino = require('pino');
 
 const app = express();
@@ -11,7 +10,6 @@ app.use(cors());
 app.use(express.json()); 
 const port = process.env.PORT || 3000;
 
-let qrImage = '';
 let botStatus = 'Başlatılıyor...';
 let sockInstance = null;
 let isConnected = false;
@@ -26,14 +24,13 @@ db.serialize(() => {
 });
 
 // --------------------------------------------------------
-// 2. WHATSAPP MOTORU (GELİŞMİŞ SÜRÜM)
+// 2. WHATSAPP MOTORU
 // --------------------------------------------------------
 async function connectToWhatsApp() {
     let auth;
     try {
         auth = await useMultiFileAuthState('auth_info_baileys');
     } catch (e) {
-        console.log("Hatalı oturum temizleniyor...");
         try { fs.rmSync('./auth_info_baileys', { recursive: true, force: true }); } catch (err) {}
         auth = await useMultiFileAuthState('auth_info_baileys');
     }
@@ -46,7 +43,7 @@ async function connectToWhatsApp() {
         logger: pino({ level: 'silent' }), 
         printQRInTerminal: false,
         auth: state,
-        browser: ["WP Tracker", "Chrome", "1.0.0"],
+        browser: ["Ubuntu", "Chrome", "20.0.04"], // SMS kodu almayı kolaylaştıran tarayıcı kimliği
         syncFullHistory: false
     });
 
@@ -54,12 +51,7 @@ async function connectToWhatsApp() {
     sock.ev.on('creds.update', saveCreds);
 
     sock.ev.on('connection.update', async (update) => {
-        const { connection, lastDisconnect, qr } = update;
-        
-        if (qr) {
-            botStatus = 'Karekod Bekleniyor...';
-            qrImage = await qrcode.toDataURL(qr); 
-        }
+        const { connection, lastDisconnect } = update;
         
         if (connection === 'close') {
             isConnected = false;
@@ -69,14 +61,11 @@ async function connectToWhatsApp() {
                 setTimeout(connectToWhatsApp, 3000);
             } else {
                 botStatus = 'Çıkış yapıldı. Lütfen sıfırlayın.';
-                qrImage = '';
             }
         } else if (connection === 'open') {
             isConnected = true;
             botStatus = 'Bağlandı 🟢';
-            qrImage = '';
             
-            // Veritabanındaki numaraları radara al
             db.all("SELECT number FROM targets", [], (err, rows) => {
                 if (rows) {
                     rows.forEach(async (row) => {
@@ -87,7 +76,6 @@ async function connectToWhatsApp() {
         }
     });
 
-    // TAKİP 1: ÇEVRİMİÇİ / ÇEVRİMDIŞI LOGLARI
     sock.ev.on('presence.update', (json) => {
         try {
             const id = json.id.split('@')[0];
@@ -108,7 +96,6 @@ async function connectToWhatsApp() {
         } catch (e) {}
     });
 
-    // TAKİP 2: HİKAYE (STORY) YAKALAYICI
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
         if (type === 'notify') {
             for (const msg of messages) {
@@ -134,7 +121,29 @@ connectToWhatsApp();
 // 3. API UÇ NOKTALARI
 // --------------------------------------------------------
 app.get('/api/status', (req, res) => {
-    res.json({ registered: isConnected, status: botStatus, qr: qrImage });
+    res.json({ registered: isConnected, status: botStatus });
+});
+
+// YENİDEN EKLENEN SMS (EŞLEŞTİRME KODU) ROTASI
+app.get('/api/pair', async (req, res) => {
+    let phone = req.query.phone;
+    if (!phone) return res.json({ success: false, message: "Numara eksik" });
+    phone = phone.replace(/[^0-9]/g, '');
+
+    if (isConnected) {
+        return res.json({ success: false, message: "Sistem zaten bir hesaba bağlı." });
+    }
+    if (!sockInstance) {
+        return res.json({ success: false, message: "Sistem henüz hazır değil, lütfen 5 saniye bekleyin." });
+    }
+
+    try {
+        let code = await sockInstance.requestPairingCode(phone);
+        let formattedCode = code?.match(/.{1,4}/g)?.join('-') || code;
+        res.json({ success: true, code: formattedCode });
+    } catch (error) {
+        res.json({ success: false, message: "WhatsApp kodu vermedi. Olası sebep: Numara formatı hatalı veya çok fazla deneme yapıldı." });
+    }
 });
 
 app.get('/api/targets', (req, res) => {
@@ -151,17 +160,15 @@ app.post('/api/add-target', async (req, res) => {
     
     if (sockInstance && isConnected) {
         try {
-            // Profil Fotosu Çek
             const fetchedUrl = await sockInstance.profilePictureUrl(`${number}@s.whatsapp.net`, 'image');
             if(fetchedUrl) picUrl = fetchedUrl;
 
-            // İsim boşsa "Hakkımda" bilgisini çek
             if (!finalName || finalName.trim() === '') {
                 const fetchedStatus = await sockInstance.fetchStatus(`${number}@s.whatsapp.net`);
-                finalName = fetchedStatus?.status || `Bilinmeyen (${number.slice(-4)})`;
+                finalName = fetchedStatus?.status || \`Bilinmeyen (\${number.slice(-4)})\`;
             }
         } catch (e) {
-            if(!finalName) finalName = `Kişi (${number.slice(-4)})`;
+            if(!finalName) finalName = \`Kişi (\${number.slice(-4)})\`;
         }
     }
 
@@ -176,12 +183,12 @@ app.post('/api/add-target', async (req, res) => {
 });
 
 app.get('/api/logs', (req, res) => {
-    const query = `
+    const query = \`
         SELECT logs.*, targets.name, targets.pic_url 
         FROM logs 
         LEFT JOIN targets ON logs.number = targets.number 
         ORDER BY timestamp DESC LIMIT 50
-    `;
+    \`;
     db.all(query, [], (err, rows) => {
         res.json(rows || []);
     });
@@ -189,17 +196,16 @@ app.get('/api/logs', (req, res) => {
 
 app.get('/api/reset', (req, res) => {
     try { fs.rmSync('./auth_info_baileys', { recursive: true, force: true }); } catch(e) {}
-    qrImage = '';
     isConnected = false;
     res.json({ success: true });
     setTimeout(() => process.exit(1), 1000); 
 });
 
 // --------------------------------------------------------
-// 4. WEB ARAYÜZÜ (HTML/CSS)
+// 4. WEB ARAYÜZÜ (SMS VERSİYONU)
 // --------------------------------------------------------
 app.get('/', (req, res) => {
-    res.send(`
+    res.send(\`
 <!DOCTYPE html>
 <html lang="tr">
 <head>
@@ -225,6 +231,7 @@ app.get('/', (req, res) => {
         .online { color: #25D366; font-weight: bold; }
         .offline { color: #dc3545; font-weight: bold; }
         .story { color: #34b7f1; font-weight: bold; }
+        .code-display { font-size: 32px; font-weight: bold; color: #075E54; text-align: center; letter-spacing: 5px; margin: 20px 0; background: #e9edef; padding: 15px; border-radius: 8px;}
     </style>
 </head>
 <body>
@@ -235,8 +242,14 @@ app.get('/', (req, res) => {
     <div id="loginSection" class="section">
         <h3 style="text-align:center; color:#075E54;">Sistemi Başlat</h3>
         <p style="text-align:center; font-size:14px; color:#666;" id="statusText">Yükleniyor...</p>
-        <div id="qrContainer" style="text-align: center; margin: 20px 0;"></div>
-        <button class="btn-danger" onclick="resetSystem()">Sıfırla</button>
+        
+        <div style="background:#fafafa; padding:15px; border-radius:8px; border:1px solid #eee; margin-bottom:20px;">
+            <input type="text" id="botNumber" placeholder="Kendi Numaranız (Örn: 905...)">
+            <button onclick="getCode()">Eşleştirme Kodu Al</button>
+            <div id="codeResult"></div>
+        </div>
+
+        <button class="btn-danger" onclick="resetSystem()">Oturumu Sıfırla / Temizle</button>
     </div>
 
     <div id="dashboardSection" class="section">
@@ -267,11 +280,27 @@ app.get('/', (req, res) => {
             } else {
                 document.getElementById('loginSection').classList.add('active-section');
                 document.getElementById('statusText').innerText = data.status;
-                if (data.qr) {
-                    document.getElementById('qrContainer').innerHTML = '<img src="' + data.qr + '" style="width:250px; border:2px solid #ccc; border-radius:10px;">';
-                }
             }
         } catch(e) {}
+    }
+
+    async function getCode() {
+        const num = document.getElementById('botNumber').value;
+        if(!num) return alert("Lütfen kendi numaranızı girin!");
+        
+        const btn = event.target;
+        btn.innerText = "Kod İsteniyor...";
+        
+        const res = await fetch('/api/pair?phone=' + num);
+        const data = await res.json();
+        
+        if(data.success) {
+            document.getElementById('codeResult').innerHTML = '<div class="code-display">' + data.code + '</div><p style="text-align:center; color:red; font-size:12px;">Kodu girmek için 60 saniyeniz var!</p>';
+            btn.innerText = "Eşleştirme Kodu Al";
+        } else {
+            alert(data.message);
+            btn.innerText = "Eşleştirme Kodu Al";
+        }
     }
 
     async function addTarget() {
@@ -314,7 +343,7 @@ app.get('/', (req, res) => {
     }
 
     async function resetSystem() {
-        if(confirm("Emin misiniz?")) {
+        if(confirm("Emin misiniz? Oturum silinecek.")) {
             await fetch('/api/reset');
             location.reload();
         }
@@ -327,8 +356,8 @@ app.get('/', (req, res) => {
 
 </body>
 </html>
-    `);
+    \`);
 });
 
 app.listen(port, () => console.log("Hazır!"));
-               
+    
