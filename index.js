@@ -14,14 +14,12 @@ let botStatus = 'Başlatılıyor...';
 let sockInstance = null;
 let isConnected = false;
 
-// VERİTABANI
 const db = new sqlite3.Database('./tracker.db');
 db.serialize(() => {
     db.run("CREATE TABLE IF NOT EXISTS targets (number TEXT PRIMARY KEY, name TEXT, pic_url TEXT)");
     db.run("CREATE TABLE IF NOT EXISTS logs (number TEXT, status TEXT, timestamp DATETIME)");
 });
 
-// WHATSAPP MOTORU (AGRESİF MOD)
 async function connectToWhatsApp() {
     let auth;
     try {
@@ -32,17 +30,16 @@ async function connectToWhatsApp() {
     }
 
     const { state, saveCreds } = auth;
-    const { version, isLatest } = await fetchLatestBaileysVersion();
-    console.log(`Baileys Sürümü: ${version.join('.')}, En güncel mi: ${isLatest}`);
+    const { version } = await fetchLatestBaileysVersion();
 
     const sock = makeWASocket({
         version,
         logger: pino({ level: 'silent' }), 
         printQRInTerminal: false,
         auth: state,
-        browser: ["Windows", "Chrome", "20.0.04"],
+        browser: ["Ubuntu", "Chrome", "20.0.04"],
         syncFullHistory: false,
-        markOnlineOnConnect: true // BOTU ZORLA ÇEVRİMİÇİ YAPAR (KRİTİK)
+        markOnlineOnConnect: true // Botu zorla çevrimiçi yapar
     });
 
     sockInstance = sock;
@@ -64,34 +61,28 @@ async function connectToWhatsApp() {
             isConnected = true;
             botStatus = 'Bağlandı 🟢';
             
-            // Botun kendisini ağda "Müsait/Çevrimiçi" olarak bağırması lazım
-            await sock.sendPresenceUpdate('available');
-            
+            try { await sock.sendPresenceUpdate('available'); } catch(e){}
             startAggressivePolling();
         }
     });
 
-    // EKSİK OLAN PARÇA: SÜREKLİ YOKLAMA (POLLING) MOTORU
     function startAggressivePolling() {
         setInterval(() => {
             if (!sockInstance || !isConnected) return;
-            
-            // Botun kendi durumunu taze tutması
             sockInstance.sendPresenceUpdate('available').catch(()=>{});
 
             db.all("SELECT number FROM targets", [], (err, rows) => {
                 if (rows) {
                     rows.forEach(async (row) => {
                         try {
-                            const jid = `${row.number}@s.whatsapp.net`;
-                            // Sadece abone olma, bana son durumu "ŞU AN" yolla diye zorla
+                            const jid = row.number + '@s.whatsapp.net';
                             await sockInstance.presenceSubscribe(jid);
                             await sockInstance.sendPresenceUpdate('available', jid); 
                         } catch(e){}
                     });
                 }
             });
-        }, 15000); // HER 15 SANİYEDE BİR WHATSAPP'I DÜRT
+        }, 15000); 
     }
 
     sock.ev.on('presence.update', (json) => {
@@ -114,11 +105,26 @@ async function connectToWhatsApp() {
         } catch (e) {}
     });
 
+    sock.ev.on('messages.upsert', async ({ messages, type }) => {
+        if (type === 'notify') {
+            for (const msg of messages) {
+                if (msg.key.remoteJid === 'status@broadcast') {
+                    const senderNum = (msg.key.participant || msg.participant || "").split('@')[0];
+                    db.get("SELECT * FROM targets WHERE number = ?", [senderNum], (err, row) => {
+                        if (row) {
+                            const time = new Date().toLocaleString('tr-TR', { timeZone: 'Europe/Istanbul' });
+                            db.run("INSERT INTO logs (number, status, timestamp) VALUES (?, ?, ?)", [senderNum, "Yeni Durum Paylaştı 📸", time]);
+                        }
+                    });
+                }
+            }
+        }
+    });
+    
     return sock;
 }
 connectToWhatsApp();
 
-// API UÇ NOKTALARI
 app.get('/api/status', (req, res) => res.json({ registered: isConnected, status: botStatus }));
 
 app.get('/api/pair', async (req, res) => {
@@ -127,7 +133,7 @@ app.get('/api/pair', async (req, res) => {
     phone = phone.replace(/[^0-9]/g, '');
 
     if (isConnected) return res.json({ success: false, message: "Sistem zaten bağlı." });
-    if (!sockInstance) return res.json({ success: false, message: "Sistem hazırlanıyor, 5 sn bekleyin." });
+    if (!sockInstance) return res.json({ success: false, message: "Sistem hazırlanıyor, bekleyin." });
 
     try {
         let code = await sockInstance.requestPairingCode(phone);
@@ -151,17 +157,13 @@ app.post('/api/add-target', async (req, res) => {
     
     if (sockInstance && isConnected) {
         try {
-            const fetchedUrl = await sockInstance.profilePictureUrl(`${number}@s.whatsapp.net`, 'image');
+            const fetchedUrl = await sockInstance.profilePictureUrl(number + '@s.whatsapp.net', 'image');
             if(fetchedUrl) picUrl = fetchedUrl;
             if (!finalName) {
-                const fetchedStatus = await sockInstance.fetchStatus(`${number}@s.whatsapp.net`);
-                finalName = fetchedStatus?.status || `Kişi (${number.slice(-4)})`;
+                const fetchedStatus = await sockInstance.fetchStatus(number + '@s.whatsapp.net');
+                finalName = fetchedStatus?.status || 'Kişi (' + number.slice(-4) + ')';
             }
-            
-            // Eklenir eklenmez agresif takip başlat
-            const jid = `${number}@s.whatsapp.net`;
-            await sockInstance.presenceSubscribe(jid);
-            
+            await sockInstance.presenceSubscribe(number + '@s.whatsapp.net');
         } catch (e) {}
     }
     db.run("INSERT OR REPLACE INTO targets (number, name, pic_url) VALUES (?, ?, ?)", [number, finalName || number, picUrl], (err) => res.json({ success: !err }));
@@ -173,7 +175,6 @@ app.get('/api/reset', (req, res) => {
     res.json({ success: true });
 });
 
-// WEB ARAYÜZÜ
 app.get('/', (req, res) => {
     res.send(`
 <!DOCTYPE html>
@@ -261,7 +262,7 @@ app.get('/', (req, res) => {
         await fetch('/api/add-target', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ name, number })
+            body: JSON.stringify({ name: name, number: number })
         });
         location.reload();
     }
@@ -279,7 +280,7 @@ app.get('/', (req, res) => {
         const logs = await res.json();
         let html = '';
         logs.forEach(l => {
-            let sClass = l.status === 'available' ? 'online' : 'offline';
+            let sClass = l.status === 'available' ? 'online' : (l.status.includes('Durum') ? 'story' : 'offline');
             let sText = l.status === 'available' ? 'Çevrimiçi 🟢' : (l.status === 'unavailable' ? 'Çevrimdışı 🔴' : l.status);
             html += '<div class="log-item"><img src="'+l.pic_url+'"><div><b>'+l.name+'</b><div class="'+sClass+'">'+sText+'</div><small>'+l.timestamp+'</small></div></div>';
         });
@@ -294,4 +295,3 @@ app.get('/', (req, res) => {
 });
 
 app.listen(port, () => console.log("Hazır!"));
-                                                                                                              
