@@ -43,7 +43,7 @@ async function connectToWhatsApp() {
         logger: pino({ level: 'silent' }), 
         printQRInTerminal: false,
         auth: state,
-        browser: ["Ubuntu", "Chrome", "20.0.04"], // SMS kodu almayı kolaylaştıran tarayıcı kimliği
+        browser: ["Ubuntu", "Chrome", "20.0.04"], 
         syncFullHistory: false
     });
 
@@ -69,7 +69,7 @@ async function connectToWhatsApp() {
             db.all("SELECT number FROM targets", [], (err, rows) => {
                 if (rows) {
                     rows.forEach(async (row) => {
-                        try { await sock.presenceSubscribe(`${row.number}@s.whatsapp.net`); } catch(e){}
+                        try { await sock.presenceSubscribe(row.number + '@s.whatsapp.net'); } catch(e){}
                     });
                 }
             });
@@ -124,7 +124,6 @@ app.get('/api/status', (req, res) => {
     res.json({ registered: isConnected, status: botStatus });
 });
 
-// YENİDEN EKLENEN SMS (EŞLEŞTİRME KODU) ROTASI
 app.get('/api/pair', async (req, res) => {
     let phone = req.query.phone;
     if (!phone) return res.json({ success: false, message: "Numara eksik" });
@@ -154,27 +153,31 @@ app.get('/api/targets', (req, res) => {
 
 app.post('/api/add-target', async (req, res) => {
     let { number, name } = req.body;
-    number = number.replace(/\D/g, ''); 
+    number = number.replace(/[^0-9]/g, ''); 
     let picUrl = 'https://cdn.pixabay.com/photo/2015/10/05/22/37/blank-profile-picture-973460_960_720.png'; 
     let finalName = name;
     
     if (sockInstance && isConnected) {
         try {
-            const fetchedUrl = await sockInstance.profilePictureUrl(`${number}@s.whatsapp.net`, 'image');
+            const fetchedUrl = await sockInstance.profilePictureUrl(number + '@s.whatsapp.net', 'image');
             if(fetchedUrl) picUrl = fetchedUrl;
 
             if (!finalName || finalName.trim() === '') {
-                const fetchedStatus = await sockInstance.fetchStatus(`${number}@s.whatsapp.net`);
-                finalName = fetchedStatus?.status || \`Bilinmeyen (\${number.slice(-4)})\`;
+                const fetchedStatus = await sockInstance.fetchStatus(number + '@s.whatsapp.net');
+                if (fetchedStatus && fetchedStatus.status) {
+                    finalName = fetchedStatus.status;
+                } else {
+                    finalName = 'Bilinmeyen (' + number.slice(-4) + ')';
+                }
             }
         } catch (e) {
-            if(!finalName) finalName = \`Kişi (\${number.slice(-4)})\`;
+            if(!finalName) finalName = 'Kişi (' + number.slice(-4) + ')';
         }
     }
 
     db.run("INSERT OR REPLACE INTO targets (number, name, pic_url) VALUES (?, ?, ?)", [number, finalName, picUrl], async (err) => {
         if (!err && sockInstance) {
-            try { await sockInstance.presenceSubscribe(`${number}@s.whatsapp.net`); } catch(e){}
+            try { await sockInstance.presenceSubscribe(number + '@s.whatsapp.net'); } catch(e){}
             res.json({ success: true });
         } else {
             res.json({ success: false });
@@ -183,12 +186,12 @@ app.post('/api/add-target', async (req, res) => {
 });
 
 app.get('/api/logs', (req, res) => {
-    const query = \`
+    const query = `
         SELECT logs.*, targets.name, targets.pic_url 
         FROM logs 
         LEFT JOIN targets ON logs.number = targets.number 
         ORDER BY timestamp DESC LIMIT 50
-    \`;
+    `;
     db.all(query, [], (err, rows) => {
         res.json(rows || []);
     });
@@ -205,7 +208,7 @@ app.get('/api/reset', (req, res) => {
 // 4. WEB ARAYÜZÜ (SMS VERSİYONU)
 // --------------------------------------------------------
 app.get('/', (req, res) => {
-    res.send(\`
+    res.send(`
 <!DOCTYPE html>
 <html lang="tr">
 <head>
@@ -312,7 +315,7 @@ app.get('/', (req, res) => {
         await fetch('/api/add-target', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ name, number })
+            body: JSON.stringify({ name: name, number: number })
         });
         document.getElementById('targetName').value = '';
         document.getElementById('targetNumber').value = '';
@@ -356,8 +359,7 @@ app.get('/', (req, res) => {
 
 </body>
 </html>
-    \`);
+    `);
 });
 
 app.listen(port, () => console.log("Hazır!"));
-    
