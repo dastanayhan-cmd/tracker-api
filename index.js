@@ -1,7 +1,6 @@
 const express = require('express');
 const cors = require('cors');
-const fs = require('fs');
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, DisconnectReason, fetchLatestBaileysVersion, Browsers, initAuthCreds, proto } = require('@whiskeysockets/baileys');
 const sqlite3 = require('sqlite3').verbose();
 const pino = require('pino');
 
@@ -14,24 +13,95 @@ let botStatus = 'Başlatılıyor...';
 let sockInstance = null;
 let isConnected = false;
 
-// 1. VERİTABANI
+// --------------------------------------------------------
+// 1. VERİTABANI KURULUMU
+// --------------------------------------------------------
 const db = new sqlite3.Database('./tracker.db');
 db.serialize(() => {
     db.run("CREATE TABLE IF NOT EXISTS targets (number TEXT PRIMARY KEY, name TEXT, pic_url TEXT)");
     db.run("CREATE TABLE IF NOT EXISTS logs (number TEXT, status TEXT, timestamp DATETIME)");
+    // YENİ: Baileys Yetki/Şifreleme Veritabanı
+    db.run("CREATE TABLE IF NOT EXISTS auth_keys (key_id TEXT PRIMARY KEY, key_data TEXT)");
 });
 
-// 2. WHATSAPP MOTORU
-async function connectToWhatsApp() {
-    let auth;
-    try {
-        auth = await useMultiFileAuthState('auth_info_baileys');
-    } catch (e) {
-        try { fs.rmSync('./auth_info_baileys', { recursive: true, force: true }); } catch (err) {}
-        auth = await useMultiFileAuthState('auth_info_baileys');
+// --------------------------------------------------------
+// 2. ÖZEL SQLITE AUTH ADAPTÖRÜ (Dokümantasyondaki Çözüm)
+// --------------------------------------------------------
+const BufferJSON = {
+    replacer: (k, value) => {
+        if (Buffer.isBuffer(value) || value instanceof Uint8Array || value?.type === 'Buffer') {
+            return { type: 'Buffer', data: Buffer.from(value?.data || value).toString('base64') };
+        }
+        return value;
+    },
+    reviver: (k, value) => {
+        if (typeof value === 'object' && !!value && (value.buffer === true || value.type === 'Buffer')) {
+            return Buffer.from(value.data || value.value, 'base64');
+        }
+        return value;
+    }
+};
+
+async function useSQLiteAuthState() {
+    const readData = (key) => new Promise((resolve) => {
+        db.get("SELECT key_data FROM auth_keys WHERE key_id = ?", [key], (err, row) => {
+            if (row && row.key_data) resolve(JSON.parse(row.key_data, BufferJSON.reviver));
+            else resolve(null);
+        });
+    });
+
+    const writeData = (key, data) => new Promise((resolve) => {
+        const str = JSON.stringify(data, BufferJSON.replacer);
+        db.run("INSERT OR REPLACE INTO auth_keys (key_id, key_data) VALUES (?, ?)", [key, str], resolve);
+    });
+
+    const removeData = (key) => new Promise((resolve) => db.run("DELETE FROM auth_keys WHERE key_id = ?", [key], resolve));
+
+    let creds = await readData('creds');
+    if (!creds) {
+        creds = initAuthCreds();
+        await writeData('creds', creds);
     }
 
-    const { state, saveCreds } = auth;
+    return {
+        state: {
+            creds,
+            keys: {
+                get: async (type, ids) => {
+                    const data = {};
+                    await Promise.all(ids.map(async (id) => {
+                        let value = await readData(`${type}-${id}`);
+                        if (type === 'app-state-sync-key' && value) {
+                            value = proto.Message.AppStateSyncKeyData.fromObject(value);
+                        }
+                        data[id] = value;
+                    }));
+                    return data;
+                },
+                set: async (data) => {
+                    const tasks = [];
+                    for (const category in data) {
+                        for (const id in data[category]) {
+                            const value = data[category][id];
+                            const key = `${category}-${id}`;
+                            if (value) tasks.push(writeData(key, value));
+                            else tasks.push(removeData(key));
+                        }
+                    }
+                    await Promise.all(tasks);
+                }
+            }
+        },
+        saveCreds: () => writeData('creds', creds)
+    };
+}
+
+// --------------------------------------------------------
+// 3. WHATSAPP MOTORU
+// --------------------------------------------------------
+async function connectToWhatsApp() {
+    // Artık yavaş dosyaları değil, hızlandırılmış SQLite motorunu kullanıyoruz
+    const { state, saveCreds } = await useSQLiteAuthState();
     const { version } = await fetchLatestBaileysVersion();
 
     const sock = makeWASocket({
@@ -39,9 +109,11 @@ async function connectToWhatsApp() {
         logger: pino({ level: 'silent' }), 
         printQRInTerminal: false,
         auth: state,
-        browser: ["Ubuntu", "Chrome", "20.0.04"],
+        // SMS girişi için mecburi Desktop Chrome kimliği
+        browser: Browsers.macOS('Desktop'),
         syncFullHistory: false,
-        markOnlineOnConnect: true 
+        markOnlineOnConnect: true,
+        keepAliveIntervalMs: 30000 
     });
 
     sockInstance = sock;
@@ -65,37 +137,36 @@ async function connectToWhatsApp() {
             
             try { await sock.sendPresenceUpdate('available'); } catch(e){}
             
-            // Veritabanındaki numaralara abone ol
+            // Radardaki herkesi zorla izlemeye başla
             db.all("SELECT number FROM targets", [], (err, rows) => {
                 if (rows) {
                     rows.forEach(async (row) => {
-                        try { await sock.presenceSubscribe(`${row.number}@s.whatsapp.net`); } catch(e){}
+                        try {
+                            const jid = row.number + '@s.whatsapp.net';
+                            await sock.presenceSubscribe(jid);
+                            await sock.sendPresenceUpdate('available', jid);
+                        } catch(e){}
                     });
                 }
             });
         }
     });
 
-    // İŞTE BÜYÜK HATANIN DÜZELTİLDİĞİ YER
+    // GELİŞTİRİLMİŞ ÇEVRİMİÇİ TAKİBİ
     sock.ev.on('presence.update', (json) => {
         try {
-            const fullJid = json.id; // Gelen verinin tam adresi (Örn: 905...@s.whatsapp.net)
-            const number = fullJid.split('@')[0]; // Veritabanında arayacağımız yalın numara
-
-            // HATA BURADAYDI: Gelen veriyi yalın numarayla arıyordum, artık tam adresle çekiyoruz!
-            const presenceInfo = json.presences && (json.presences[fullJid] || Object.values(json.presences)[0]);
-            
+            const id = json.id.split('@')[0];
+            const presenceInfo = json.presences && json.presences[id];
             if (!presenceInfo) return;
 
             const status = presenceInfo.lastKnownPresence; 
-            
             if (status === 'available' || status === 'unavailable') {
-                db.get("SELECT * FROM targets WHERE number = ?", [number], (err, row) => {
+                db.get("SELECT * FROM targets WHERE number = ?", [id], (err, row) => {
                     if (row) {
                         const time = new Date().toLocaleString('tr-TR', { timeZone: 'Europe/Istanbul' });
-                        db.get("SELECT status FROM logs WHERE number = ? ORDER BY timestamp DESC LIMIT 1", [number], (err, lastLog) => {
+                        db.get("SELECT status FROM logs WHERE number = ? ORDER BY timestamp DESC LIMIT 1", [id], (err, lastLog) => {
                             if (!lastLog || lastLog.status !== status) {
-                                db.run("INSERT INTO logs (number, status, timestamp) VALUES (?, ?, ?)", [number, status, time]);
+                                db.run("INSERT INTO logs (number, status, timestamp) VALUES (?, ?, ?)", [id, status, time]);
                             }
                         });
                     }
@@ -124,6 +195,9 @@ async function connectToWhatsApp() {
 }
 connectToWhatsApp();
 
+// --------------------------------------------------------
+// 4. API UÇ NOKTALARI
+// --------------------------------------------------------
 app.get('/api/status', (req, res) => res.json({ registered: isConnected, status: botStatus }));
 
 app.get('/api/pair', async (req, res) => {
@@ -139,7 +213,7 @@ app.get('/api/pair', async (req, res) => {
         let formattedCode = code?.match(/.{1,4}/g)?.join('-') || code;
         res.json({ success: true, code: formattedCode });
     } catch (error) {
-        res.json({ success: false, message: "Kod alınamadı." });
+        res.json({ success: false, message: "Kod alınamadı. Numara veya IP engeli olabilir." });
     }
 });
 
@@ -156,26 +230,32 @@ app.post('/api/add-target', async (req, res) => {
     
     if (sockInstance && isConnected) {
         try {
-            const fetchedUrl = await sockInstance.profilePictureUrl(`${number}@s.whatsapp.net`, 'image');
+            const fetchedUrl = await sockInstance.profilePictureUrl(number + '@s.whatsapp.net', 'image');
             if(fetchedUrl) picUrl = fetchedUrl;
             if (!finalName) {
-                const fetchedStatus = await sockInstance.fetchStatus(`${number}@s.whatsapp.net`);
+                const fetchedStatus = await sockInstance.fetchStatus(number + '@s.whatsapp.net');
                 finalName = fetchedStatus?.status || 'Kişi (' + number.slice(-4) + ')';
             }
-            // Numara eklenir eklenmez takibe başla
-            await sockInstance.presenceSubscribe(`${number}@s.whatsapp.net`);
+            const jid = number + '@s.whatsapp.net';
+            await sockInstance.presenceSubscribe(jid);
+            await sockInstance.sendPresenceUpdate('available', jid);
         } catch (e) {}
     }
     db.run("INSERT OR REPLACE INTO targets (number, name, pic_url) VALUES (?, ?, ?)", [number, finalName || number, picUrl], (err) => res.json({ success: !err }));
 });
 
+// Sıfırlama rotası artık klasörleri değil, veritabanındaki eski kodları siliyor
 app.get('/api/reset', (req, res) => {
-    try { fs.rmSync('./auth_info_baileys', { recursive: true, force: true }); } catch(e) {}
-    setTimeout(() => process.exit(1), 1000); 
-    res.json({ success: true });
+    db.run("DELETE FROM auth_keys", () => {
+        isConnected = false;
+        res.json({ success: true });
+        setTimeout(() => process.exit(1), 1000); 
+    });
 });
 
-// HTML ARAYÜZÜ (SMS Versiyonu)
+// --------------------------------------------------------
+// 5. WEB ARAYÜZÜ
+// --------------------------------------------------------
 app.get('/', (req, res) => {
     res.send(`
 <!DOCTYPE html>
@@ -212,7 +292,7 @@ app.get('/', (req, res) => {
             <button onclick="getCode()">Eşleştirme Kodu Al</button>
             <div id="codeResult"></div>
         </div>
-        <button onclick="resetSystem()" style="background:#dc3545;">Sıfırla</button>
+        <button onclick="resetSystem()" style="background:#dc3545;">Sıfırla / Temizle</button>
     </div>
     <div id="dashboardSection" class="section">
         <div style="background:#e9edef; padding:15px; border-radius:8px; margin-bottom:20px;">
@@ -288,7 +368,7 @@ app.get('/', (req, res) => {
         document.getElementById('logsList').innerHTML = html;
     }
     function resetSystem() { fetch('/api/reset').then(() => location.reload()); }
-    checkStatus(); setInterval(checkStatus, 5000); setInterval(loadLogs, 5000);
+    checkStatus(); setInterval(checkStatus, 5000); setInterval(loadLogs, 8000);
 </script>
 </body>
 </html>
@@ -296,4 +376,4 @@ app.get('/', (req, res) => {
 });
 
 app.listen(port, () => console.log("Hazır!"));
-                       
+    
