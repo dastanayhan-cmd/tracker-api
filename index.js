@@ -13,20 +13,15 @@ let botStatus = 'Başlatılıyor...';
 let sockInstance = null;
 let isConnected = false;
 
-// --------------------------------------------------------
-// 1. VERİTABANI KURULUMU
-// --------------------------------------------------------
+// 1. VERİTABANI
 const db = new sqlite3.Database('./tracker.db');
 db.serialize(() => {
     db.run("CREATE TABLE IF NOT EXISTS targets (number TEXT PRIMARY KEY, name TEXT, pic_url TEXT)");
     db.run("CREATE TABLE IF NOT EXISTS logs (number TEXT, status TEXT, timestamp DATETIME)");
-    // YENİ: Baileys Yetki/Şifreleme Veritabanı
     db.run("CREATE TABLE IF NOT EXISTS auth_keys (key_id TEXT PRIMARY KEY, key_data TEXT)");
 });
 
-// --------------------------------------------------------
-// 2. ÖZEL SQLITE AUTH ADAPTÖRÜ (Dokümantasyondaki Çözüm)
-// --------------------------------------------------------
+// 2. ÖZEL SQLITE AUTH ADAPTÖRÜ (Güvenli Oturum)
 const BufferJSON = {
     replacer: (k, value) => {
         if (Buffer.isBuffer(value) || value instanceof Uint8Array || value?.type === 'Buffer') {
@@ -49,12 +44,10 @@ async function useSQLiteAuthState() {
             else resolve(null);
         });
     });
-
     const writeData = (key, data) => new Promise((resolve) => {
         const str = JSON.stringify(data, BufferJSON.replacer);
         db.run("INSERT OR REPLACE INTO auth_keys (key_id, key_data) VALUES (?, ?)", [key, str], resolve);
     });
-
     const removeData = (key) => new Promise((resolve) => db.run("DELETE FROM auth_keys WHERE key_id = ?", [key], resolve));
 
     let creds = await readData('creds');
@@ -96,11 +89,8 @@ async function useSQLiteAuthState() {
     };
 }
 
-// --------------------------------------------------------
 // 3. WHATSAPP MOTORU
-// --------------------------------------------------------
 async function connectToWhatsApp() {
-    // Artık yavaş dosyaları değil, hızlandırılmış SQLite motorunu kullanıyoruz
     const { state, saveCreds } = await useSQLiteAuthState();
     const { version } = await fetchLatestBaileysVersion();
 
@@ -109,8 +99,8 @@ async function connectToWhatsApp() {
         logger: pino({ level: 'silent' }), 
         printQRInTerminal: false,
         auth: state,
-        // SMS girişi için mecburi Desktop Chrome kimliği
-        browser: Browsers.macOS('Desktop'),
+        // İŞTE SENİN BULDUĞUN O HAYAT KURTARAN DÜZELTME:
+        browser: Browsers.macOS('Google Chrome'), // SMS Kodunun gelmesi için bu şartmış!
         syncFullHistory: false,
         markOnlineOnConnect: true,
         keepAliveIntervalMs: 30000 
@@ -137,7 +127,6 @@ async function connectToWhatsApp() {
             
             try { await sock.sendPresenceUpdate('available'); } catch(e){}
             
-            // Radardaki herkesi zorla izlemeye başla
             db.all("SELECT number FROM targets", [], (err, rows) => {
                 if (rows) {
                     rows.forEach(async (row) => {
@@ -152,7 +141,6 @@ async function connectToWhatsApp() {
         }
     });
 
-    // GELİŞTİRİLMİŞ ÇEVRİMİÇİ TAKİBİ
     sock.ev.on('presence.update', (json) => {
         try {
             const id = json.id.split('@')[0];
@@ -193,11 +181,11 @@ async function connectToWhatsApp() {
     
     return sock;
 }
-connectToWhatsApp();
 
-// --------------------------------------------------------
+// Olası sistem çökmelerini engellemek için Hata Yakalayıcı
+connectToWhatsApp().catch(err => console.log("Başlatma Hatası:", err));
+
 // 4. API UÇ NOKTALARI
-// --------------------------------------------------------
 app.get('/api/status', (req, res) => res.json({ registered: isConnected, status: botStatus }));
 
 app.get('/api/pair', async (req, res) => {
@@ -244,7 +232,6 @@ app.post('/api/add-target', async (req, res) => {
     db.run("INSERT OR REPLACE INTO targets (number, name, pic_url) VALUES (?, ?, ?)", [number, finalName || number, picUrl], (err) => res.json({ success: !err }));
 });
 
-// Sıfırlama rotası artık klasörleri değil, veritabanındaki eski kodları siliyor
 app.get('/api/reset', (req, res) => {
     db.run("DELETE FROM auth_keys", () => {
         isConnected = false;
@@ -253,9 +240,7 @@ app.get('/api/reset', (req, res) => {
     });
 });
 
-// --------------------------------------------------------
 // 5. WEB ARAYÜZÜ
-// --------------------------------------------------------
 app.get('/', (req, res) => {
     res.send(`
 <!DOCTYPE html>
@@ -376,4 +361,4 @@ app.get('/', (req, res) => {
 });
 
 app.listen(port, () => console.log("Hazır!"));
-    
+                                            
