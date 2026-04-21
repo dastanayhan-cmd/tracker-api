@@ -1,6 +1,6 @@
 const express = require('express');
 const cors = require('cors');
-const fs = require('fs'); 
+const fs = require('fs');
 const { default: makeWASocket, useMultiFileAuthState, Browsers, DisconnectReason } = require('@whiskeysockets/baileys');
 const sqlite3 = require('sqlite3').verbose();
 const pino = require('pino');
@@ -16,39 +16,23 @@ let globalQR = '';
 // --------------------------------------------------------
 // 1. VERİTABANI
 // --------------------------------------------------------
-const db = new sqlite3.Database('./tracker.db', (err) => {
-    if (err) console.error("Veritabanı hatası:", err.message);
-});
-
+const db = new sqlite3.Database('./tracker.db');
 db.serialize(() => {
     db.run("CREATE TABLE IF NOT EXISTS targets (number TEXT PRIMARY KEY, name TEXT, pic_url TEXT)");
     db.run("CREATE TABLE IF NOT EXISTS logs (number TEXT, status TEXT, timestamp DATETIME)");
 });
 
 // --------------------------------------------------------
-// 2. WHATSAPP MOTORU (ZIRHLI SÜRÜM)
+// 2. WHATSAPP MOTORU (İLK GÜNKÜ SADE VE ÇALIŞAN HALİ)
 // --------------------------------------------------------
 async function connectToWhatsApp() {
-    let auth;
-    try {
-        // Dosyayı okumayı dener
-        auth = await useMultiFileAuthState('auth_info');
-    } catch (error) {
-        // Dosya bozuksa Node'u çökertmek yerine dosyayı silip sıfırdan oluşturur
-        console.log("Auth klasörü bozulmuş, temizleniyor...");
-        try { fs.rmSync('./auth_info', { recursive: true, force: true }); } catch (e) {}
-        auth = await useMultiFileAuthState('auth_info');
-    }
-
-    const { state, saveCreds } = auth;
+    const { state, saveCreds } = await useMultiFileAuthState('auth_info');
     
     const sock = makeWASocket({
         auth: state,
         logger: pino({ level: 'silent' }),
         printQRInTerminal: false,
-        syncFullHistory: false, 
-        markOnlineOnConnect: false,
-        browser: Browsers.ubuntu('Chrome')
+        browser: Browsers.ubuntu('Chrome') // İlk günkü çalışan tarayıcı kimliğimiz
     });
 
     sockInstance = sock;
@@ -57,23 +41,25 @@ async function connectToWhatsApp() {
     sock.ev.on('connection.update', (update) => {
         const { connection, lastDisconnect, qr } = update;
         
-        if (qr) globalQR = qr; 
+        if (qr) globalQR = qr;
 
         if (connection === 'close') {
             const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut;
             if (shouldReconnect) {
+                console.log("Bağlantı koptu, yeniden bağlanılıyor...");
                 setTimeout(connectToWhatsApp, 3000);
             } else {
+                console.log("Çıkış yapıldı.");
                 globalQR = '';
-                try { fs.rmSync('./auth_info', { recursive: true, force: true }); } catch(e){}
             }
         } else if (connection === 'open') {
-            console.log("WhatsApp API bağlandı! 🟢");
-            globalQR = ''; 
+            console.log("WhatsApp API Bağlandı! 🟢");
+            globalQR = '';
+            // Uyanınca kayıtlı numaraları dinlemeye başla
             db.all("SELECT number FROM targets", [], (err, rows) => {
                 if (rows) {
                     rows.forEach(async (row) => {
-                        try { await sock.presenceSubscribe(row.number + '@s.whatsapp.net'); } catch(e) {}
+                        try { await sock.presenceSubscribe(row.number + '@s.whatsapp.net'); } catch(e){}
                     });
                 }
             });
@@ -101,10 +87,8 @@ async function connectToWhatsApp() {
     });
 }
 
-// Global Çökme Engelleyici
-connectToWhatsApp().catch(err => {
-    console.error("WhatsApp motoru başlatılamadı:", err);
-});
+// Sistemi doğrudan başlat
+connectToWhatsApp();
 
 // --------------------------------------------------------
 // 3. API UÇ NOKTALARI
@@ -118,6 +102,7 @@ app.get('/api/qr', (req, res) => {
     res.json({ qr: globalQR });
 });
 
+// Gerekirse klasörü temizle ve yeniden başlat
 app.get('/api/reset', (req, res) => {
     try { fs.rmSync('./auth_info', { recursive: true, force: true }); } catch(e) {}
     globalQR = '';
@@ -125,31 +110,27 @@ app.get('/api/reset', (req, res) => {
     setTimeout(() => process.exit(1), 1000); 
 });
 
+// KOD İSTEME: İLK GÜNKÜ SADE MANTIK
 app.get('/api/pair', async (req, res) => {
     let phone = req.query.phone;
     if (!phone) return res.json({ success: false, message: "Numara eksik" });
-    
     phone = phone.replace(/[^0-9]/g, '');
 
-    if (sockInstance && sockInstance.authState?.creds?.registered) {
+    if (sockInstance && sockInstance.authState.creds.registered) {
         return res.json({ success: false, message: "Sistem zaten bir hesaba bağlı." });
     }
 
+    if (!sockInstance) {
+        return res.json({ success: false, message: "Sistem henüz hazır değil, 5 saniye bekleyip tekrar deneyin." });
+    }
+
     try {
-        if (sockInstance) {
-            sockInstance.ev.removeAllListeners();
-        }
-        try { fs.rmSync('./auth_info', { recursive: true, force: true }); } catch(e) {}
-
-        await connectToWhatsApp();
-        await new Promise(resolve => setTimeout(resolve, 2000));
-
+        // Tünel açıp kapatmak yok! Doğrudan mevcut motor üzerinden kodu istiyoruz.
         let code = await sockInstance.requestPairingCode(phone);
         let formattedCode = code?.match(/.{1,4}/g)?.join('-') || code;
         res.json({ success: true, code: formattedCode });
-
     } catch (error) {
-        res.json({ success: false, message: "Kod üretilemedi, WhatsApp sunucuları isteği reddetti. Lütfen Sistemi Sıfırlayıp 10 dk sonra deneyin." });
+        res.json({ success: false, message: "WhatsApp şu an kodu reddetti. Sistemi Sıfırla butonuna basıp tekrar deneyin." });
     }
 });
 
@@ -191,7 +172,7 @@ app.get('/api/logs', (req, res) => {
 });
 
 // --------------------------------------------------------
-// 4. WEB ARAYÜZÜ 
+// 4. WEB ARAYÜZÜ
 // --------------------------------------------------------
 app.get('/', (req, res) => {
     res.send(`
@@ -235,7 +216,7 @@ app.get('/', (req, res) => {
             <p>Hazırlanıyor...</p>
         </div>
 
-        <button class="btn-danger" onclick="resetSystem()">Sistemi Sıfırla (Karekod Gelmiyorsa Tıkla)</button>
+        <button class="btn-danger" onclick="resetSystem()">Sistemi Sıfırla (Karekod/Kod Gelmiyorsa Tıkla)</button>
 
         <hr style="border:0; border-top:1px solid #eee; margin:20px 0;">
         <p style="font-size:14px; color:#666; text-align:center;">Veya şansınızı SMS kodu ile deneyin:</p>
@@ -306,7 +287,7 @@ app.get('/', (req, res) => {
     async function getCode() {
         const num = document.getElementById('botNumber').value;
         if(!num) return alert("Numara girin!");
-        document.getElementById('codeResult').innerHTML = '<p>Şifreli tünel açılıyor, kod isteniyor... (5-10 saniye sürebilir)</p>';
+        document.getElementById('codeResult').innerHTML = '<p>Kod isteniyor, lütfen bekleyin...</p>';
         const res = await fetch('/api/pair?phone=' + num);
         const data = await res.json();
         if(data.success) {
@@ -374,4 +355,4 @@ app.get('/', (req, res) => {
 app.listen(port, () => {
     console.log("Sunucu " + port + " portunda hazır.");
 });
-                                                
+         
