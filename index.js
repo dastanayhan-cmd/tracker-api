@@ -1,7 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, Browsers } = require('@whiskeysockets/baileys');
 const sqlite3 = require('sqlite3').verbose();
 const qrcode = require('qrcode');
 const pino = require('pino');
@@ -14,10 +14,10 @@ const port = process.env.PORT || 3000;
 let qrImage = '';
 let botStatus = 'Başlatılıyor...';
 let sockInstance = null;
-let isConnected = false; // YENİ: Panel açılışını yönetecek kesin bağlantı bayrağı
+let isConnected = false;
 
 // --------------------------------------------------------
-// 1. VERİTABANI
+// 1. VERİTABANI KURULUMU
 // --------------------------------------------------------
 const db = new sqlite3.Database('./tracker.db');
 db.serialize(() => {
@@ -26,10 +26,19 @@ db.serialize(() => {
 });
 
 // --------------------------------------------------------
-// 2. WHATSAPP MOTORU
+// 2. WHATSAPP MOTORU (GELİŞMİŞ SÜRÜM)
 // --------------------------------------------------------
 async function connectToWhatsApp() {
-    const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
+    let auth;
+    try {
+        auth = await useMultiFileAuthState('auth_info_baileys');
+    } catch (e) {
+        console.log("Hatalı oturum temizleniyor...");
+        try { fs.rmSync('./auth_info_baileys', { recursive: true, force: true }); } catch (err) {}
+        auth = await useMultiFileAuthState('auth_info_baileys');
+    }
+
+    const { state, saveCreds } = auth;
     const { version } = await fetchLatestBaileysVersion();
 
     const sock = makeWASocket({
@@ -37,7 +46,8 @@ async function connectToWhatsApp() {
         logger: pino({ level: 'silent' }), 
         printQRInTerminal: false,
         auth: state,
-        browser: ["WP Tracker", "Chrome", "1.0.0"] 
+        browser: ["WP Tracker", "Chrome", "1.0.0"],
+        syncFullHistory: false
     });
 
     sockInstance = sock;
@@ -52,20 +62,21 @@ async function connectToWhatsApp() {
         }
         
         if (connection === 'close') {
-            isConnected = false; // Bağlantı koparsa paneli kapat
+            isConnected = false;
             const shouldReconnect = (lastDisconnect.error)?.output?.statusCode !== DisconnectReason.loggedOut;
             if (shouldReconnect) {
                 botStatus = 'Yeniden bağlanılıyor...';
                 setTimeout(connectToWhatsApp, 3000);
             } else {
-                botStatus = 'Çıkış yapıldı.';
+                botStatus = 'Çıkış yapıldı. Lütfen sıfırlayın.';
                 qrImage = '';
             }
         } else if (connection === 'open') {
-            isConnected = true; // BAĞLANDIĞI AN PANELİ AÇTIRACAK KOMUT
+            isConnected = true;
             botStatus = 'Bağlandı 🟢';
             qrImage = '';
             
+            // Veritabanındaki numaraları radara al
             db.all("SELECT number FROM targets", [], (err, rows) => {
                 if (rows) {
                     rows.forEach(async (row) => {
@@ -76,6 +87,7 @@ async function connectToWhatsApp() {
         }
     });
 
+    // TAKİP 1: ÇEVRİMİÇİ / ÇEVRİMDIŞI LOGLARI
     sock.ev.on('presence.update', (json) => {
         try {
             const id = json.id.split('@')[0];
@@ -83,11 +95,9 @@ async function connectToWhatsApp() {
             if (!presenceInfo) return;
 
             const status = presenceInfo.lastKnownPresence; 
-            
             db.get("SELECT * FROM targets WHERE number = ?", [id], (err, row) => {
                 if (row && (status === 'available' || status === 'unavailable')) {
                     const time = new Date().toLocaleString('tr-TR', { timeZone: 'Europe/Istanbul' });
-                    
                     db.get("SELECT status FROM logs WHERE number = ? ORDER BY timestamp DESC LIMIT 1", [id], (err, lastLog) => {
                         if (!lastLog || lastLog.status !== status) {
                             db.run("INSERT INTO logs (number, status, timestamp) VALUES (?, ?, ?)", [id, status, time]);
@@ -96,6 +106,24 @@ async function connectToWhatsApp() {
                 }
             });
         } catch (e) {}
+    });
+
+    // TAKİP 2: HİKAYE (STORY) YAKALAYICI
+    sock.ev.on('messages.upsert', async ({ messages, type }) => {
+        if (type === 'notify') {
+            for (const msg of messages) {
+                if (msg.key.remoteJid === 'status@broadcast') {
+                    const senderNum = (msg.key.participant || msg.participant || "").split('@')[0];
+                    db.get("SELECT * FROM targets WHERE number = ?", [senderNum], (err, row) => {
+                        if (row) {
+                            const time = new Date().toLocaleString('tr-TR', { timeZone: 'Europe/Istanbul' });
+                            const logText = "Yeni bir Durum (Story) paylaştı 📸";
+                            db.run("INSERT INTO logs (number, status, timestamp) VALUES (?, ?, ?)", [senderNum, logText, time]);
+                        }
+                    });
+                }
+            }
+        }
     });
     
     return sock;
@@ -106,7 +134,6 @@ connectToWhatsApp();
 // 3. API UÇ NOKTALARI
 // --------------------------------------------------------
 app.get('/api/status', (req, res) => {
-    // Arayüz artık güvenilmez 'creds' değişkenine değil, bizim kesin isConnected komutumuza bakacak.
     res.json({ registered: isConnected, status: botStatus, qr: qrImage });
 });
 
@@ -120,20 +147,30 @@ app.post('/api/add-target', async (req, res) => {
     let { number, name } = req.body;
     number = number.replace(/\D/g, ''); 
     let picUrl = 'https://cdn.pixabay.com/photo/2015/10/05/22/37/blank-profile-picture-973460_960_720.png'; 
+    let finalName = name;
     
     if (sockInstance && isConnected) {
         try {
+            // Profil Fotosu Çek
             const fetchedUrl = await sockInstance.profilePictureUrl(`${number}@s.whatsapp.net`, 'image');
             if(fetchedUrl) picUrl = fetchedUrl;
-        } catch (e) {}
+
+            // İsim boşsa "Hakkımda" bilgisini çek
+            if (!finalName || finalName.trim() === '') {
+                const fetchedStatus = await sockInstance.fetchStatus(`${number}@s.whatsapp.net`);
+                finalName = fetchedStatus?.status || `Bilinmeyen (${number.slice(-4)})`;
+            }
+        } catch (e) {
+            if(!finalName) finalName = `Kişi (${number.slice(-4)})`;
+        }
     }
 
-    db.run("INSERT OR REPLACE INTO targets (number, name, pic_url) VALUES (?, ?, ?)", [number, name, picUrl], async (err) => {
-        if (!err && sockInstance && isConnected) {
+    db.run("INSERT OR REPLACE INTO targets (number, name, pic_url) VALUES (?, ?, ?)", [number, finalName, picUrl], async (err) => {
+        if (!err && sockInstance) {
             try { await sockInstance.presenceSubscribe(`${number}@s.whatsapp.net`); } catch(e){}
-            res.json({ success: true, message: "Numara başarıyla eklendi!" });
+            res.json({ success: true });
         } else {
-            res.json({ success: false, message: "Eklenemedi." });
+            res.json({ success: false });
         }
     });
 });
@@ -159,7 +196,7 @@ app.get('/api/reset', (req, res) => {
 });
 
 // --------------------------------------------------------
-// 4. MOBİL UYUMLU PROFESYONEL WEB ARAYÜZÜ
+// 4. WEB ARAYÜZÜ (HTML/CSS)
 // --------------------------------------------------------
 app.get('/', (req, res) => {
     res.send(`
@@ -187,6 +224,7 @@ app.get('/', (req, res) => {
         .log-time { font-size: 11px; color: #888; margin-top: 4px; }
         .online { color: #25D366; font-weight: bold; }
         .offline { color: #dc3545; font-weight: bold; }
+        .story { color: #34b7f1; font-weight: bold; }
     </style>
 </head>
 <body>
@@ -196,29 +234,23 @@ app.get('/', (req, res) => {
 
     <div id="loginSection" class="section">
         <h3 style="text-align:center; color:#075E54;">Sistemi Başlat</h3>
-        <p style="text-align:center; font-size:14px; color:#666;" id="statusText">Durum kontrol ediliyor...</p>
-        
-        <div id="qrContainer" style="text-align: center; margin: 20px 0;">
-        </div>
-
-        <button class="btn-danger" onclick="resetSystem()">Oturumu / Karekodu Sıfırla</button>
+        <p style="text-align:center; font-size:14px; color:#666;" id="statusText">Yükleniyor...</p>
+        <div id="qrContainer" style="text-align: center; margin: 20px 0;"></div>
+        <button class="btn-danger" onclick="resetSystem()">Sıfırla</button>
     </div>
 
     <div id="dashboardSection" class="section">
         <div style="background:#e9edef; padding:15px; border-radius:8px; margin-bottom:20px;">
-            <h4 style="margin-top:0;">Yeni Hedef Ekle</h4>
-            <input type="text" id="targetName" placeholder="Kişi Adı (Örn: Yağmur)">
+            <input type="text" id="targetName" placeholder="İsim (Boş bırakırsan 'Hakkımda' çekilir)">
             <input type="text" id="targetNumber" placeholder="Numara (905...)">
             <button onclick="addTarget()">Takibe Başla</button>
         </div>
 
-        <h3>Radardaki Kişiler</h3>
-        <div id="targetsList">Yükleniyor...</div>
+        <h3>Takip Edilenler</h3>
+        <div id="targetsList"></div>
         <hr style="border:0; border-top:1px solid #ddd; margin:20px 0;">
         <h3>Canlı Hareketler</h3>
-        <div id="logsList" style="background:#fafafa; border-radius:8px; border:1px solid #eee; max-height:400px; overflow-y:auto;">
-            Yükleniyor...
-        </div>
+        <div id="logsList" style="background:#fafafa; border-radius:8px; max-height:400px; overflow-y:auto;"></div>
     </div>
 </div>
 
@@ -227,7 +259,6 @@ app.get('/', (req, res) => {
         try {
             const res = await fetch('/api/status');
             const data = await res.json();
-            
             if (data.registered) {
                 document.getElementById('loginSection').classList.remove('active-section');
                 document.getElementById('dashboardSection').classList.add('active-section');
@@ -235,47 +266,29 @@ app.get('/', (req, res) => {
                 loadLogs();
             } else {
                 document.getElementById('loginSection').classList.add('active-section');
-                document.getElementById('statusText').innerHTML = '<strong>' + data.status + '</strong>';
+                document.getElementById('statusText').innerText = data.status;
                 if (data.qr) {
-                    document.getElementById('qrContainer').innerHTML = '<img src="' + data.qr + '" style="border-radius:10px; border:2px solid #ccc; width:250px;">';
-                } else {
-                    document.getElementById('qrContainer').innerHTML = '';
+                    document.getElementById('qrContainer').innerHTML = '<img src="' + data.qr + '" style="width:250px; border:2px solid #ccc; border-radius:10px;">';
                 }
             }
         } catch(e) {}
     }
 
-    async function resetSystem() {
-        if(confirm("Tüm bağlantı koparılacak. Emin misiniz?")) {
-            await fetch('/api/reset');
-            alert("Sıfırlanıyor...");
-            setTimeout(() => location.reload(), 3000);
-        }
-    }
-
     async function addTarget() {
         const name = document.getElementById('targetName').value;
         const number = document.getElementById('targetNumber').value;
-        if(!name || !number) return alert("Bilgileri doldurun!");
-        
+        if(!number) return alert("Numara şart!");
         const btn = event.target;
-        btn.innerText = "Profil Fotoğrafı Aranıyor...";
-        
-        const res = await fetch('/api/add-target', {
+        btn.innerText = "Bilgiler Çekiliyor...";
+        await fetch('/api/add-target', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ name, number })
         });
-        const data = await res.json();
-        
-        if(data.success) {
-            document.getElementById('targetName').value = '';
-            document.getElementById('targetNumber').value = '';
-            loadTargets();
-            btn.innerText = "Takibe Başla";
-        } else {
-            btn.innerText = "Takibe Başla";
-        }
+        document.getElementById('targetName').value = '';
+        document.getElementById('targetNumber').value = '';
+        loadTargets();
+        btn.innerText = "Takibe Başla";
     }
 
     async function loadTargets() {
@@ -283,9 +296,9 @@ app.get('/', (req, res) => {
         const targets = await res.json();
         let html = '';
         targets.forEach(t => {
-            html += '<div class="target-card"><img src="' + t.pic_url + '" alt="Profil"><div class="target-info"><h4>' + t.name + '</h4><p>+' + t.number + '</p></div></div>';
+            html += '<div class="target-card"><img src="' + t.pic_url + '"><div class="target-info"><h4>' + t.name + '</h4><p>+' + t.number + '</p></div></div>';
         });
-        document.getElementById('targetsList').innerHTML = html || '<p style="font-size:14px; color:#666;">Henüz eklenen kişi yok.</p>';
+        document.getElementById('targetsList').innerHTML = html || 'Henüz kimse yok.';
     }
 
     async function loadLogs() {
@@ -293,18 +306,23 @@ app.get('/', (req, res) => {
         const logs = await res.json();
         let html = '';
         logs.forEach(l => {
-            const statusClass = l.status === 'available' ? 'online' : 'offline';
-            const statusText = l.status === 'available' ? 'Çevrimiçi 🟢' : 'Çevrimdışı 🔴';
-            const pic = l.pic_url || 'https://cdn.pixabay.com/photo/2015/10/05/22/37/blank-profile-picture-973460_960_720.png';
-            const name = l.name || l.number;
-            html += '<div class="log-item"><img src="' + pic + '" alt="Profil"><div><div style="font-weight:bold;">' + name + '</div><div class="' + statusClass + '">' + statusText + '</div><div class="log-time">' + l.timestamp + '</div></div></div>';
+            let statusClass = l.status === 'available' ? 'online' : (l.status.includes('Durum') ? 'story' : 'offline');
+            let statusText = l.status === 'available' ? 'Çevrimiçi 🟢' : (l.status === 'unavailable' ? 'Çevrimdışı 🔴' : l.status);
+            html += '<div class="log-item"><img src="' + (l.pic_url || '') + '" style="width:40px;height:40px;border-radius:50%;margin-right:10px;"><div><div style="font-weight:bold;">' + l.name + '</div><div class="' + statusClass + '">' + statusText + '</div><div class="log-time">' + l.timestamp + '</div></div></div>';
         });
-        document.getElementById('logsList').innerHTML = html || '<p style="padding:15px; font-size:14px; color:#666;">Hareket bekleniyor...</p>';
+        document.getElementById('logsList').innerHTML = html || 'Bekleniyor...';
+    }
+
+    async function resetSystem() {
+        if(confirm("Emin misiniz?")) {
+            await fetch('/api/reset');
+            location.reload();
+        }
     }
 
     checkStatus();
-    setInterval(checkStatus, 3000); 
-    setInterval(loadLogs, 5000); 
+    setInterval(checkStatus, 5000);
+    setInterval(loadLogs, 10000);
 </script>
 
 </body>
@@ -312,7 +330,5 @@ app.get('/', (req, res) => {
     `);
 });
 
-app.listen(port, () => {
-    console.log("Sistem " + port + " portunda hazır.");
-});
-            
+app.listen(port, () => console.log("Hazır!"));
+               
