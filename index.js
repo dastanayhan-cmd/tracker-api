@@ -8,15 +8,16 @@ const pino = require('pino');
 
 const app = express();
 app.use(cors());
-app.use(express.json()); // API formatı için JSON kullanıyoruz
+app.use(express.json()); 
 const port = process.env.PORT || 3000;
 
 let qrImage = '';
 let botStatus = 'Başlatılıyor...';
 let sockInstance = null;
+let isConnected = false; // YENİ: Panel açılışını yönetecek kesin bağlantı bayrağı
 
 // --------------------------------------------------------
-// 1. VERİTABANI (Çoklu Numara ve İsimler İçin)
+// 1. VERİTABANI
 // --------------------------------------------------------
 const db = new sqlite3.Database('./tracker.db');
 db.serialize(() => {
@@ -25,7 +26,7 @@ db.serialize(() => {
 });
 
 // --------------------------------------------------------
-// 2. WHATSAPP MOTORU (Çalışan Sade Çekirdek)
+// 2. WHATSAPP MOTORU
 // --------------------------------------------------------
 async function connectToWhatsApp() {
     const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
@@ -36,7 +37,7 @@ async function connectToWhatsApp() {
         logger: pino({ level: 'silent' }), 
         printQRInTerminal: false,
         auth: state,
-        browser: ["WP Tracker", "Chrome", "1.0.0"] // Çalışan sihirli kimlik
+        browser: ["WP Tracker", "Chrome", "1.0.0"] 
     });
 
     sockInstance = sock;
@@ -47,10 +48,11 @@ async function connectToWhatsApp() {
         
         if (qr) {
             botStatus = 'Karekod Bekleniyor...';
-            qrImage = await qrcode.toDataURL(qr); // QR'ı direkt resme çevirir
+            qrImage = await qrcode.toDataURL(qr); 
         }
         
         if (connection === 'close') {
+            isConnected = false; // Bağlantı koparsa paneli kapat
             const shouldReconnect = (lastDisconnect.error)?.output?.statusCode !== DisconnectReason.loggedOut;
             if (shouldReconnect) {
                 botStatus = 'Yeniden bağlanılıyor...';
@@ -60,10 +62,10 @@ async function connectToWhatsApp() {
                 qrImage = '';
             }
         } else if (connection === 'open') {
+            isConnected = true; // BAĞLANDIĞI AN PANELİ AÇTIRACAK KOMUT
             botStatus = 'Bağlandı 🟢';
             qrImage = '';
             
-            // Veritabanındaki tüm numaraları radara al
             db.all("SELECT number FROM targets", [], (err, rows) => {
                 if (rows) {
                     rows.forEach(async (row) => {
@@ -82,12 +84,10 @@ async function connectToWhatsApp() {
 
             const status = presenceInfo.lastKnownPresence; 
             
-            // Eğer numara veritabanımızda varsa işlemi yap
             db.get("SELECT * FROM targets WHERE number = ?", [id], (err, row) => {
                 if (row && (status === 'available' || status === 'unavailable')) {
                     const time = new Date().toLocaleString('tr-TR', { timeZone: 'Europe/Istanbul' });
                     
-                    // Art arda aynı durumu yazmayı engelle
                     db.get("SELECT status FROM logs WHERE number = ? ORDER BY timestamp DESC LIMIT 1", [id], (err, lastLog) => {
                         if (!lastLog || lastLog.status !== status) {
                             db.run("INSERT INTO logs (number, status, timestamp) VALUES (?, ?, ?)", [id, status, time]);
@@ -103,11 +103,11 @@ async function connectToWhatsApp() {
 connectToWhatsApp();
 
 // --------------------------------------------------------
-// 3. API UÇ NOKTALARI (Android'in veri çekeceği yerler)
+// 3. API UÇ NOKTALARI
 // --------------------------------------------------------
 app.get('/api/status', (req, res) => {
-    const isRegistered = sockInstance?.authState?.creds?.registered || false;
-    res.json({ registered: isRegistered, status: botStatus, qr: qrImage });
+    // Arayüz artık güvenilmez 'creds' değişkenine değil, bizim kesin isConnected komutumuza bakacak.
+    res.json({ registered: isConnected, status: botStatus, qr: qrImage });
 });
 
 app.get('/api/targets', (req, res) => {
@@ -118,19 +118,18 @@ app.get('/api/targets', (req, res) => {
 
 app.post('/api/add-target', async (req, res) => {
     let { number, name } = req.body;
-    number = number.replace(/\D/g, ''); // Sadece rakamları al
+    number = number.replace(/\D/g, ''); 
     let picUrl = 'https://cdn.pixabay.com/photo/2015/10/05/22/37/blank-profile-picture-973460_960_720.png'; 
     
-    if (sockInstance) {
+    if (sockInstance && isConnected) {
         try {
-            // Profil Fotoğrafını Çekme Motoru
             const fetchedUrl = await sockInstance.profilePictureUrl(`${number}@s.whatsapp.net`, 'image');
             if(fetchedUrl) picUrl = fetchedUrl;
         } catch (e) {}
     }
 
     db.run("INSERT OR REPLACE INTO targets (number, name, pic_url) VALUES (?, ?, ?)", [number, name, picUrl], async (err) => {
-        if (!err && sockInstance) {
+        if (!err && sockInstance && isConnected) {
             try { await sockInstance.presenceSubscribe(`${number}@s.whatsapp.net`); } catch(e){}
             res.json({ success: true, message: "Numara başarıyla eklendi!" });
         } else {
@@ -154,6 +153,7 @@ app.get('/api/logs', (req, res) => {
 app.get('/api/reset', (req, res) => {
     try { fs.rmSync('./auth_info_baileys', { recursive: true, force: true }); } catch(e) {}
     qrImage = '';
+    isConnected = false;
     res.json({ success: true });
     setTimeout(() => process.exit(1), 1000); 
 });
@@ -199,7 +199,7 @@ app.get('/', (req, res) => {
         <p style="text-align:center; font-size:14px; color:#666;" id="statusText">Durum kontrol ediliyor...</p>
         
         <div id="qrContainer" style="text-align: center; margin: 20px 0;">
-            </div>
+        </div>
 
         <button class="btn-danger" onclick="resetSystem()">Oturumu / Karekodu Sıfırla</button>
     </div>
@@ -235,9 +235,11 @@ app.get('/', (req, res) => {
                 loadLogs();
             } else {
                 document.getElementById('loginSection').classList.add('active-section');
-                document.getElementById('statusText').innerText = data.status;
+                document.getElementById('statusText').innerHTML = '<strong>' + data.status + '</strong>';
                 if (data.qr) {
                     document.getElementById('qrContainer').innerHTML = '<img src="' + data.qr + '" style="border-radius:10px; border:2px solid #ccc; width:250px;">';
+                } else {
+                    document.getElementById('qrContainer').innerHTML = '';
                 }
             }
         } catch(e) {}
@@ -271,6 +273,8 @@ app.get('/', (req, res) => {
             document.getElementById('targetNumber').value = '';
             loadTargets();
             btn.innerText = "Takibe Başla";
+        } else {
+            btn.innerText = "Takibe Başla";
         }
     }
 
@@ -299,7 +303,7 @@ app.get('/', (req, res) => {
     }
 
     checkStatus();
-    setInterval(checkStatus, 3000); // QR ve bağlantı kontrolünü hızlı yap
+    setInterval(checkStatus, 3000); 
     setInterval(loadLogs, 5000); 
 </script>
 
@@ -311,4 +315,4 @@ app.get('/', (req, res) => {
 app.listen(port, () => {
     console.log("Sistem " + port + " portunda hazır.");
 });
-        
+            
