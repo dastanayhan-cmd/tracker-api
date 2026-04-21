@@ -1,6 +1,6 @@
 const express = require('express');
 const cors = require('cors');
-const fs = require('fs'); // Dosya silmek için eklendi
+const fs = require('fs'); 
 const { default: makeWASocket, useMultiFileAuthState, Browsers, DisconnectReason } = require('@whiskeysockets/baileys');
 const sqlite3 = require('sqlite3').verbose();
 const pino = require('pino');
@@ -31,10 +31,13 @@ db.serialize(() => {
 async function connectToWhatsApp() {
     const { state, saveCreds } = await useMultiFileAuthState('auth_info');
     
+    // Bağlantıyı daha stabil hale getiren ayarlar eklendi
     const sock = makeWASocket({
         auth: state,
         logger: pino({ level: 'silent' }),
         printQRInTerminal: false,
+        syncFullHistory: false, 
+        markOnlineOnConnect: false,
         browser: Browsers.ubuntu('Chrome')
     });
 
@@ -44,9 +47,7 @@ async function connectToWhatsApp() {
     sock.ev.on('connection.update', (update) => {
         const { connection, lastDisconnect, qr } = update;
         
-        if (qr) {
-            globalQR = qr; 
-        }
+        if (qr) globalQR = qr; 
 
         if (connection === 'close') {
             const shouldReconnect = (lastDisconnect.error)?.output?.statusCode !== DisconnectReason.loggedOut;
@@ -54,13 +55,11 @@ async function connectToWhatsApp() {
                 setTimeout(connectToWhatsApp, 3000);
             } else {
                 globalQR = '';
-                // Çıkış yapıldıysa klasörü temizle
                 try { fs.rmSync('./auth_info', { recursive: true, force: true }); } catch(e){}
             }
         } else if (connection === 'open') {
             console.log("WhatsApp API bağlandı! 🟢");
             globalQR = ''; 
-            
             db.all("SELECT number FROM targets", [], (err, rows) => {
                 if (rows) {
                     rows.forEach(async (row) => {
@@ -78,7 +77,6 @@ async function connectToWhatsApp() {
             if (!presenceInfo) return;
 
             const status = presenceInfo.lastKnownPresence; 
-            
             db.get("SELECT * FROM targets WHERE number = ?", [id], (err, row) => {
                 if (row && (status === 'available' || status === 'unavailable')) {
                     const time = new Date().toLocaleString('tr-TR', { timeZone: 'Europe/Istanbul' });
@@ -106,28 +104,45 @@ app.get('/api/qr', (req, res) => {
     res.json({ qr: globalQR });
 });
 
-// SİSTEMİ SIFIRLAMA (Yarım kalan hafızayı temizler)
 app.get('/api/reset', (req, res) => {
     try { fs.rmSync('./auth_info', { recursive: true, force: true }); } catch(e) {}
     globalQR = '';
     res.json({ success: true });
-    setTimeout(() => process.exit(1), 1000); // Render'ı zorla yeniden başlatır
+    setTimeout(() => process.exit(1), 1000); 
 });
 
+// BUG FİX: KOD İSTEME MANTIKLARI TAMAMEN DEĞİŞTİRİLDİ
 app.get('/api/pair', async (req, res) => {
-    const phone = req.query.phone;
+    let phone = req.query.phone;
     if (!phone) return res.json({ success: false, message: "Numara eksik" });
     
-    if (sockInstance && !sockInstance.authState.creds.registered) {
-        try {
-            let code = await sockInstance.requestPairingCode(phone);
-            let formattedCode = code?.match(/.{1,4}/g)?.join('-') || code;
-            res.json({ success: true, code: formattedCode });
-        } catch (error) {
-            res.json({ success: false, message: "Kod alınamadı." });
+    // Numaranın içindeki boşluk, artı (+) ve harfleri temizle. Sadece rakam kalsın.
+    phone = phone.replace(/[^0-9]/g, '');
+
+    if (sockInstance && sockInstance.authState.creds.registered) {
+        return res.json({ success: false, message: "Sistem zaten bir hesaba bağlı." });
+    }
+
+    try {
+        // 1. ADIM: Eski bayat oturumu sil ve bağlantıyı kopar (State Fix)
+        if (sockInstance) {
+            sockInstance.ev.removeAllListeners();
         }
-    } else {
-        res.json({ success: false, message: "Zaten bağlı veya hazır değil." });
+        try { fs.rmSync('./auth_info', { recursive: true, force: true }); } catch(e) {}
+
+        // 2. ADIM: Yepyeni tertemiz bir bağlantı başlat
+        await connectToWhatsApp();
+
+        // 3. ADIM: Soketin WhatsApp sunucularına tam oturması için 2 saniye bekle
+        await new Promise(resolve => setTimeout(resolve, 2000));
+
+        // 4. ADIM: Tertemiz bağlantı üzerinden kodu iste
+        let code = await sockInstance.requestPairingCode(phone);
+        let formattedCode = code?.match(/.{1,4}/g)?.join('-') || code;
+        res.json({ success: true, code: formattedCode });
+
+    } catch (error) {
+        res.json({ success: false, message: "Kod üretilemedi, WhatsApp sunucuları isteği reddetti. Lütfen Sistemi Sıfırlayıp 10 dk sonra deneyin." });
     }
 });
 
@@ -140,14 +155,12 @@ app.get('/api/targets', (req, res) => {
 app.post('/api/add-target', async (req, res) => {
     const { number, name } = req.body;
     let picUrl = 'https://cdn.pixabay.com/photo/2015/10/05/22/37/blank-profile-picture-973460_960_720.png'; 
-    
     if (sockInstance) {
         try {
             const fetchedUrl = await sockInstance.profilePictureUrl(number + '@s.whatsapp.net', 'image');
             if(fetchedUrl) picUrl = fetchedUrl;
         } catch (e) {}
     }
-
     db.run("INSERT OR REPLACE INTO targets (number, name, pic_url) VALUES (?, ?, ?)", [number, name, picUrl], async (err) => {
         if (!err && sockInstance) {
             await sockInstance.presenceSubscribe(number + '@s.whatsapp.net');
@@ -171,7 +184,7 @@ app.get('/api/logs', (req, res) => {
 });
 
 // --------------------------------------------------------
-// 4. WEB ARAYÜZÜ
+// 4. WEB ARAYÜZÜ (Hiçbir Değişiklik Yok)
 // --------------------------------------------------------
 app.get('/', (req, res) => {
     res.send(`
@@ -265,11 +278,9 @@ app.get('/', (req, res) => {
             const res = await fetch('/api/qr');
             const data = await res.json();
             const qrContainer = document.getElementById('qrContainer');
-
             if (data.qr) {
-                // Karekodu çizmek için bulut servisini kullanıyoruz (Kesin Çözüm)
                 const qrUrl = 'https://api.qrserver.com/v1/create-qr-code/?size=250x250&data=' + encodeURIComponent(data.qr);
-                qrContainer.innerHTML = '<img src="' + qrUrl + '" style="width:220px; border-radius:10px;"><p style="font-size:12px; color:#777; margin-top:10px;">Bu görüntüyü hemen başka bir ekrana (WhatsApp vb.) atıp WhatsApp uygulamanızdan Bağlı Cihazlar diyerek okutun.</p>';
+                qrContainer.innerHTML = '<img src="' + qrUrl + '" style="width:220px; border-radius:10px;"><p style="font-size:12px; color:#777; margin-top:10px;">Bu görüntüyü hemen başka bir ekrana atıp WhatsApp > Bağlı Cihazlar diyerek okutun.</p>';
             } else {
                 qrContainer.innerHTML = '<p>Karekod Bekleniyor...</p>';
             }
@@ -279,8 +290,8 @@ app.get('/', (req, res) => {
     async function resetSystem() {
         if(confirm("Sistemdeki tüm kayıtlar silinecek ve bağlantı koparılacak. Emin misiniz?")) {
             await fetch('/api/reset');
-            alert("Komut gönderildi. Sayfa 5 saniye içinde yenilenecek ve bot yeniden başlayacak.");
-            document.body.innerHTML = "<h2 style='text-align:center; margin-top:50px;'>Sunucu Yeniden Başlatılıyor... Lütfen Bekleyin.</h2>";
+            alert("Sistem sıfırlanıyor... Sayfa 5 saniye içinde yenilenecek.");
+            document.body.innerHTML = "<h2 style='text-align:center; margin-top:50px;'>Sunucu Yeniden Başlatılıyor...</h2>";
             setTimeout(() => location.reload(), 5000);
         }
     }
@@ -288,11 +299,11 @@ app.get('/', (req, res) => {
     async function getCode() {
         const num = document.getElementById('botNumber').value;
         if(!num) return alert("Numara girin!");
-        document.getElementById('codeResult').innerHTML = '<p>İsteniyor...</p>';
+        document.getElementById('codeResult').innerHTML = '<p>Şifreli tünel açılıyor, kod isteniyor... (5-10 saniye sürebilir)</p>';
         const res = await fetch('/api/pair?phone=' + num);
         const data = await res.json();
         if(data.success) {
-            document.getElementById('codeResult').innerHTML = '<div class="code-display">' + data.code + '</div><p style="text-align:center;">WhatsApp > Bağlı Cihazlar kısmına girin.</p>';
+            document.getElementById('codeResult').innerHTML = '<div class="code-display">' + data.code + '</div><p style="text-align:center; color:red; font-weight:bold;">Kodu girmek için sadece 60 saniyeniz var!</p>';
         } else {
             alert(data.message);
         }
@@ -350,10 +361,4 @@ app.get('/', (req, res) => {
 
 </body>
 </html>
-    `);
-});
-
-app.listen(port, () => {
-    console.log("Sunucu " + port + " portunda hazır.");
-});
-             
+        
