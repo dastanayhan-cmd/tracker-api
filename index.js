@@ -26,12 +26,22 @@ db.serialize(() => {
 });
 
 // --------------------------------------------------------
-// 2. WHATSAPP MOTORU
+// 2. WHATSAPP MOTORU (ZIRHLI SÜRÜM)
 // --------------------------------------------------------
 async function connectToWhatsApp() {
-    const { state, saveCreds } = await useMultiFileAuthState('auth_info');
+    let auth;
+    try {
+        // Dosyayı okumayı dener
+        auth = await useMultiFileAuthState('auth_info');
+    } catch (error) {
+        // Dosya bozuksa Node'u çökertmek yerine dosyayı silip sıfırdan oluşturur
+        console.log("Auth klasörü bozulmuş, temizleniyor...");
+        try { fs.rmSync('./auth_info', { recursive: true, force: true }); } catch (e) {}
+        auth = await useMultiFileAuthState('auth_info');
+    }
+
+    const { state, saveCreds } = auth;
     
-    // Bağlantıyı daha stabil hale getiren ayarlar eklendi
     const sock = makeWASocket({
         auth: state,
         logger: pino({ level: 'silent' }),
@@ -50,7 +60,7 @@ async function connectToWhatsApp() {
         if (qr) globalQR = qr; 
 
         if (connection === 'close') {
-            const shouldReconnect = (lastDisconnect.error)?.output?.statusCode !== DisconnectReason.loggedOut;
+            const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut;
             if (shouldReconnect) {
                 setTimeout(connectToWhatsApp, 3000);
             } else {
@@ -63,7 +73,7 @@ async function connectToWhatsApp() {
             db.all("SELECT number FROM targets", [], (err, rows) => {
                 if (rows) {
                     rows.forEach(async (row) => {
-                        await sock.presenceSubscribe(row.number + '@s.whatsapp.net');
+                        try { await sock.presenceSubscribe(row.number + '@s.whatsapp.net'); } catch(e) {}
                     });
                 }
             });
@@ -90,7 +100,11 @@ async function connectToWhatsApp() {
         } catch (e) {}
     });
 }
-connectToWhatsApp();
+
+// Global Çökme Engelleyici
+connectToWhatsApp().catch(err => {
+    console.error("WhatsApp motoru başlatılamadı:", err);
+});
 
 // --------------------------------------------------------
 // 3. API UÇ NOKTALARI
@@ -111,32 +125,25 @@ app.get('/api/reset', (req, res) => {
     setTimeout(() => process.exit(1), 1000); 
 });
 
-// BUG FİX: KOD İSTEME MANTIKLARI TAMAMEN DEĞİŞTİRİLDİ
 app.get('/api/pair', async (req, res) => {
     let phone = req.query.phone;
     if (!phone) return res.json({ success: false, message: "Numara eksik" });
     
-    // Numaranın içindeki boşluk, artı (+) ve harfleri temizle. Sadece rakam kalsın.
     phone = phone.replace(/[^0-9]/g, '');
 
-    if (sockInstance && sockInstance.authState.creds.registered) {
+    if (sockInstance && sockInstance.authState?.creds?.registered) {
         return res.json({ success: false, message: "Sistem zaten bir hesaba bağlı." });
     }
 
     try {
-        // 1. ADIM: Eski bayat oturumu sil ve bağlantıyı kopar (State Fix)
         if (sockInstance) {
             sockInstance.ev.removeAllListeners();
         }
         try { fs.rmSync('./auth_info', { recursive: true, force: true }); } catch(e) {}
 
-        // 2. ADIM: Yepyeni tertemiz bir bağlantı başlat
         await connectToWhatsApp();
-
-        // 3. ADIM: Soketin WhatsApp sunucularına tam oturması için 2 saniye bekle
         await new Promise(resolve => setTimeout(resolve, 2000));
 
-        // 4. ADIM: Tertemiz bağlantı üzerinden kodu iste
         let code = await sockInstance.requestPairingCode(phone);
         let formattedCode = code?.match(/.{1,4}/g)?.join('-') || code;
         res.json({ success: true, code: formattedCode });
@@ -163,7 +170,7 @@ app.post('/api/add-target', async (req, res) => {
     }
     db.run("INSERT OR REPLACE INTO targets (number, name, pic_url) VALUES (?, ?, ?)", [number, name, picUrl], async (err) => {
         if (!err && sockInstance) {
-            await sockInstance.presenceSubscribe(number + '@s.whatsapp.net');
+            try { await sockInstance.presenceSubscribe(number + '@s.whatsapp.net'); } catch(e){}
             res.json({ success: true, message: "Numara başarıyla eklendi!" });
         } else {
             res.json({ success: false });
@@ -184,7 +191,7 @@ app.get('/api/logs', (req, res) => {
 });
 
 // --------------------------------------------------------
-// 4. WEB ARAYÜZÜ (Hiçbir Değişiklik Yok)
+// 4. WEB ARAYÜZÜ 
 // --------------------------------------------------------
 app.get('/', (req, res) => {
     res.send(`
@@ -361,4 +368,10 @@ app.get('/', (req, res) => {
 
 </body>
 </html>
-        
+    `);
+});
+
+app.listen(port, () => {
+    console.log("Sunucu " + port + " portunda hazır.");
+});
+                                                
