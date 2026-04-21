@@ -1,15 +1,17 @@
 {
-  "name": "tracker-api",
+  "name": "whatslives-api",
   "version": "1.0.0",
+  "description": "WhatsApp Tracker API",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
     "express": "^4.18.2",
-    "@whiskeysockets/baileys": "^6.7.5",
+    "cors": "^2.8.5",
+    "@whiskeysockets/baileys": "^6.6.0",
+    "qrcode": "^1.5.3",
     "pino": "^8.14.1",
-    "sqlite3": "^5.1.6",
-    "cors": "^2.8.5"
+    "sqlite3": "^5.1.6"
   }
 }
