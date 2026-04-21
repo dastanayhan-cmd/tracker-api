@@ -1,6 +1,6 @@
 const express = require('express');
 const cors = require('cors');
-const { default: makeWASocket, useMultiFileAuthState, Browsers } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, Browsers, DisconnectReason } = require('@whiskeysockets/baileys');
 const sqlite3 = require('sqlite3').verbose();
 const pino = require('pino');
 
@@ -35,9 +35,30 @@ async function connectToWhatsApp() {
     sockInstance = sock;
     sock.ev.on('creds.update', saveCreds);
 
+    // DÜZELTME 1: Bağlantı Kopması ve Yeniden Bağlanma Mantığı
     sock.ev.on('connection.update', (update) => {
-        const { connection } = update;
-        if (connection === 'open') console.log("WhatsApp API bağlandı!");
+        const { connection, lastDisconnect } = update;
+        
+        if (connection === 'close') {
+            const shouldReconnect = (lastDisconnect.error)?.output?.statusCode !== DisconnectReason.loggedOut;
+            if (shouldReconnect) {
+                console.log("Bağlantı koptu, yeniden bağlanılıyor...");
+                setTimeout(connectToWhatsApp, 3000);
+            } else {
+                console.log("Çıkış yapıldı. Sistem durdu.");
+            }
+        } else if (connection === 'open') {
+            console.log("WhatsApp API bağlandı! 🟢");
+            
+            // DÜZELTME 2: Sunucu yeniden başladığında veritabanındaki numaraları tekrar radara al
+            db.all("SELECT number FROM targets", [], (err, rows) => {
+                if (rows) {
+                    rows.forEach(async (row) => {
+                        await sock.presenceSubscribe(row.number + '@s.whatsapp.net');
+                    });
+                }
+            });
+        }
     });
 
     sock.ev.on('presence.update', (json) => {
@@ -51,7 +72,13 @@ async function connectToWhatsApp() {
             db.get("SELECT * FROM targets WHERE number = ?", [id], (err, row) => {
                 if (row && (status === 'available' || status === 'unavailable')) {
                     const time = new Date().toLocaleString('tr-TR', { timeZone: 'Europe/Istanbul' });
-                    db.run("INSERT INTO logs (number, status, timestamp) VALUES (?, ?, ?)", [id, status, time]);
+                    
+                    // Aynı logu saniyeler içinde üst üste yazmasını engellemek için son durumu kontrol et
+                    db.get("SELECT status FROM logs WHERE number = ? ORDER BY timestamp DESC LIMIT 1", [id], (err, lastLog) => {
+                        if (!lastLog || lastLog.status !== status) {
+                            db.run("INSERT INTO logs (number, status, timestamp) VALUES (?, ?, ?)", [id, status, time]);
+                        }
+                    });
                 }
             });
         } catch (e) {}
@@ -63,12 +90,11 @@ connectToWhatsApp();
 // API UÇ NOKTALARI (TARAYICI VE ANDROID İÇİN)
 // --------------------------------------------------------
 
-// 1. Ana Sayfa (Cannot GET / hatasını çözer)
 app.get('/', (req, res) => {
     res.send(`
         <div style="font-family: Arial; text-align: center; margin-top: 50px;">
             <h2 style="color: #25D366;">WhatsApp Tracker API Başarıyla Çalışıyor! 🚀</h2>
-            <p>Bu bir Android arka plan sunucusudur. Eşleştirme kodu almak için URL sonuna parametre ekleyin.</p>
+            <p>Bu bir Android arka plan sunucusudur. Tarayıcıdan bir işlem yapılamaz.</p>
         </div>
     `);
 });
@@ -87,19 +113,18 @@ app.get('/api/pair-android', async (req, res) => {
             res.json({ success: false, message: "Kod alınamadı." });
         }
     } else {
-        res.json({ success: false, message: "Sistem zaten bir hesaba bağlı." });
+        res.json({ success: false, message: "Sistem zaten bir hesaba bağlı veya şu an ulaşılamıyor." });
     }
 });
 
-
-// 3. Android Uygulamasının Log Çekeceği Yer
+// Android Uygulamasının Log Çekeceği Yer
 app.get('/api/logs', (req, res) => {
     db.all("SELECT * FROM logs ORDER BY timestamp DESC LIMIT 50", [], (err, rows) => {
         res.json(rows || []);
     });
 });
 
-// 4. Android Uygulamasının Numara Ekleyeceği Yer
+// Android Uygulamasının Numara Ekleyeceği Yer
 app.post('/api/add-target', async (req, res) => {
     const { number, name } = req.body;
     db.run("INSERT OR REPLACE INTO targets (number, name) VALUES (?, ?)", [number, name], async (err) => {
@@ -115,4 +140,4 @@ app.post('/api/add-target', async (req, res) => {
 app.listen(port, () => {
     console.log("Sunucu " + port + " portunda hazır.");
 });
-                    
+                                                           
