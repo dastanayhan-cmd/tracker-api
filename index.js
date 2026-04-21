@@ -73,29 +73,24 @@ app.get('/', (req, res) => {
     `);
 });
 
-// 2. Eşleştirme Kodu Alma (Tarayıcıdan anında kod almak için)
-app.get('/api/pair', async (req, res) => {
+// Android Uygulamasının Eşleştirme Kodu İsteyeceği Yer
+app.get('/api/pair-android', async (req, res) => {
     const phone = req.query.phone;
-    if (!phone) return res.send("HATA: Lütfen linkin sonuna ?phone=90532... şeklinde numaranızı ekleyin.");
+    if (!phone) return res.json({ success: false, message: "Numara eksik" });
     
     if (sockInstance && !sockInstance.authState.creds.registered) {
         try {
             let code = await sockInstance.requestPairingCode(phone);
             let formattedCode = code?.match(/.{1,4}/g)?.join('-') || code;
-            res.send(`
-                <div style="font-family: Arial; text-align: center; margin-top: 50px;">
-                    <h2>Eşleştirme Kodunuz:</h2>
-                    <h1 style="color: #075E54; letter-spacing: 5px; background: #eee; padding: 20px; display: inline-block; border-radius: 10px;">${formattedCode}</h1>
-                    <p>Hemen WhatsApp > Bağlı Cihazlar kısmından kodu girin.</p>
-                </div>
-            `);
+            res.json({ success: true, code: formattedCode });
         } catch (error) {
-            res.send("Kod alınamadı. Bot numarasını doğru girdiğinizden emin olun.");
+            res.json({ success: false, message: "Kod alınamadı." });
         }
     } else {
-        res.send("Sistem şu anda zaten bir WhatsApp hesabına bağlı veya henüz tam yüklenmedi (10 saniye bekleyip sayfayı yenileyin).");
+        res.json({ success: false, message: "Sistem zaten bir hesaba bağlı." });
     }
 });
+
 
 // 3. Android Uygulamasının Log Çekeceği Yer
 app.get('/api/logs', (req, res) => {
