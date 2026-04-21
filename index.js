@@ -14,14 +14,14 @@ let botStatus = 'Başlatılıyor...';
 let sockInstance = null;
 let isConnected = false;
 
-// 1. VERİTABANI
+// VERİTABANI
 const db = new sqlite3.Database('./tracker.db');
 db.serialize(() => {
     db.run("CREATE TABLE IF NOT EXISTS targets (number TEXT PRIMARY KEY, name TEXT, pic_url TEXT)");
     db.run("CREATE TABLE IF NOT EXISTS logs (number TEXT, status TEXT, timestamp DATETIME)");
 });
 
-// 2. WHATSAPP MOTORU
+// WHATSAPP MOTORU (AGRESİF MOD)
 async function connectToWhatsApp() {
     let auth;
     try {
@@ -32,18 +32,17 @@ async function connectToWhatsApp() {
     }
 
     const { state, saveCreds } = auth;
-    const { version } = await fetchLatestBaileysVersion();
+    const { version, isLatest } = await fetchLatestBaileysVersion();
+    console.log(`Baileys Sürümü: ${version.join('.')}, En güncel mi: ${isLatest}`);
 
     const sock = makeWASocket({
         version,
         logger: pino({ level: 'silent' }), 
         printQRInTerminal: false,
         auth: state,
-        // SMS kodu (Pairing Code) için gerekli tarayıcı kimliği
-        browser: ["Ubuntu", "Chrome", "20.0.04"],
+        browser: ["Windows", "Chrome", "20.0.04"],
         syncFullHistory: false,
-        keepAliveIntervalMs: 30000,
-        defaultQueryTimeoutMs: 60000
+        markOnlineOnConnect: true // BOTU ZORLA ÇEVRİMİÇİ YAPAR (KRİTİK)
     });
 
     sockInstance = sock;
@@ -65,27 +64,35 @@ async function connectToWhatsApp() {
             isConnected = true;
             botStatus = 'Bağlandı 🟢';
             
-            // RADARI ZORLA BAŞLAT
-            runRadarSubscription();
+            // Botun kendisini ağda "Müsait/Çevrimiçi" olarak bağırması lazım
+            await sock.sendPresenceUpdate('available');
+            
+            startAggressivePolling();
         }
     });
 
-    // RADAR ABONELİĞİ FONKSİYONU
-    async function runRadarSubscription() {
-        if (!sockInstance || !isConnected) return;
-        db.all("SELECT number FROM targets", [], (err, rows) => {
-            if (rows) {
-                rows.forEach(async (row) => {
-                    try {
-                        await sockInstance.presenceSubscribe(`${row.number}@s.whatsapp.net`);
-                        await sockInstance.onWhatsApp(`${row.number}`);
-                    } catch(e){}
-                });
-            }
-        });
-    }
+    // EKSİK OLAN PARÇA: SÜREKLİ YOKLAMA (POLLING) MOTORU
+    function startAggressivePolling() {
+        setInterval(() => {
+            if (!sockInstance || !isConnected) return;
+            
+            // Botun kendi durumunu taze tutması
+            sockInstance.sendPresenceUpdate('available').catch(()=>{});
 
-    setInterval(runRadarSubscription, 300000);
+            db.all("SELECT number FROM targets", [], (err, rows) => {
+                if (rows) {
+                    rows.forEach(async (row) => {
+                        try {
+                            const jid = `${row.number}@s.whatsapp.net`;
+                            // Sadece abone olma, bana son durumu "ŞU AN" yolla diye zorla
+                            await sockInstance.presenceSubscribe(jid);
+                            await sockInstance.sendPresenceUpdate('available', jid); 
+                        } catch(e){}
+                    });
+                }
+            });
+        }, 15000); // HER 15 SANİYEDE BİR WHATSAPP'I DÜRT
+    }
 
     sock.ev.on('presence.update', (json) => {
         try {
@@ -107,44 +114,27 @@ async function connectToWhatsApp() {
         } catch (e) {}
     });
 
-    sock.ev.on('messages.upsert', async ({ messages, type }) => {
-        if (type === 'notify') {
-            for (const msg of messages) {
-                if (msg.key.remoteJid === 'status@broadcast') {
-                    const senderNum = (msg.key.participant || msg.participant || "").split('@')[0];
-                    db.get("SELECT * FROM targets WHERE number = ?", [senderNum], (err, row) => {
-                        if (row) {
-                            const time = new Date().toLocaleString('tr-TR', { timeZone: 'Europe/Istanbul' });
-                            db.run("INSERT INTO logs (number, status, timestamp) VALUES (?, ?, ?)", [senderNum, "Yeni Durum Paylaştı 📸", time]);
-                        }
-                    });
-                }
-            }
-        }
-    });
-    
     return sock;
 }
 connectToWhatsApp();
 
-// API VE PANEL KODLARI
+// API UÇ NOKTALARI
 app.get('/api/status', (req, res) => res.json({ registered: isConnected, status: botStatus }));
 
-// SMS / EŞLEŞTİRME KODU ROTASI
 app.get('/api/pair', async (req, res) => {
     let phone = req.query.phone;
     if (!phone) return res.json({ success: false, message: "Numara eksik" });
     phone = phone.replace(/[^0-9]/g, '');
 
     if (isConnected) return res.json({ success: false, message: "Sistem zaten bağlı." });
-    if (!sockInstance) return res.json({ success: false, message: "Sistem hazırlanıyor, 5 saniye bekleyin." });
+    if (!sockInstance) return res.json({ success: false, message: "Sistem hazırlanıyor, 5 sn bekleyin." });
 
     try {
         let code = await sockInstance.requestPairingCode(phone);
         let formattedCode = code?.match(/.{1,4}/g)?.join('-') || code;
         res.json({ success: true, code: formattedCode });
     } catch (error) {
-        res.json({ success: false, message: "Kod alınamadı. Numara hatalı veya WhatsApp engelledi." });
+        res.json({ success: false, message: "Kod alınamadı." });
     }
 });
 
@@ -167,7 +157,11 @@ app.post('/api/add-target', async (req, res) => {
                 const fetchedStatus = await sockInstance.fetchStatus(`${number}@s.whatsapp.net`);
                 finalName = fetchedStatus?.status || `Kişi (${number.slice(-4)})`;
             }
-            await sockInstance.presenceSubscribe(`${number}@s.whatsapp.net`);
+            
+            // Eklenir eklenmez agresif takip başlat
+            const jid = `${number}@s.whatsapp.net`;
+            await sockInstance.presenceSubscribe(jid);
+            
         } catch (e) {}
     }
     db.run("INSERT OR REPLACE INTO targets (number, name, pic_url) VALUES (?, ?, ?)", [number, finalName || number, picUrl], (err) => res.json({ success: !err }));
@@ -179,7 +173,7 @@ app.get('/api/reset', (req, res) => {
     res.json({ success: true });
 });
 
-// HTML ARAYÜZÜ (SMS Versiyonu)
+// WEB ARAYÜZÜ
 app.get('/', (req, res) => {
     res.send(`
 <!DOCTYPE html>
@@ -211,13 +205,11 @@ app.get('/', (req, res) => {
     <div id="loginSection" class="section">
         <h3 style="text-align:center;">Sistemi Başlat (SMS Kodu)</h3>
         <p id="statusText" style="text-align:center; color:#666;"></p>
-        
         <div style="background:#fafafa; padding:15px; border-radius:8px; border:1px solid #eee; margin-bottom:20px;">
             <input type="text" id="botNumber" placeholder="Kendi Numaranız (Örn: 905...)">
             <button onclick="getCode()">Eşleştirme Kodu Al</button>
             <div id="codeResult"></div>
         </div>
-
         <button onclick="resetSystem()" style="background:#dc3545;">Sıfırla</button>
     </div>
     <div id="dashboardSection" class="section">
@@ -255,7 +247,7 @@ app.get('/', (req, res) => {
         const res = await fetch('/api/pair?phone=' + num);
         const data = await res.json();
         if(data.success) {
-            document.getElementById('codeResult').innerHTML = '<div class="code-display">' + data.code + '</div><p style="text-align:center; color:red; font-size:12px;">Kodu WhatsApp\\'a girmek için 60 saniyeniz var!</p>';
+            document.getElementById('codeResult').innerHTML = '<div class="code-display">' + data.code + '</div><p style="text-align:center; color:red; font-size:12px;">Kodu girmek için 60 saniyeniz var!</p>';
             btn.innerText = "Eşleştirme Kodu Al";
         } else {
             alert(data.message);
@@ -287,14 +279,14 @@ app.get('/', (req, res) => {
         const logs = await res.json();
         let html = '';
         logs.forEach(l => {
-            let sClass = l.status === 'available' ? 'online' : (l.status.includes('Durum') ? 'story' : 'offline');
+            let sClass = l.status === 'available' ? 'online' : 'offline';
             let sText = l.status === 'available' ? 'Çevrimiçi 🟢' : (l.status === 'unavailable' ? 'Çevrimdışı 🔴' : l.status);
             html += '<div class="log-item"><img src="'+l.pic_url+'"><div><b>'+l.name+'</b><div class="'+sClass+'">'+sText+'</div><small>'+l.timestamp+'</small></div></div>';
         });
         document.getElementById('logsList').innerHTML = html;
     }
     function resetSystem() { fetch('/api/reset').then(() => location.reload()); }
-    checkStatus(); setInterval(checkStatus, 5000); setInterval(loadLogs, 10000);
+    checkStatus(); setInterval(checkStatus, 5000); setInterval(loadLogs, 8000);
 </script>
 </body>
 </html>
@@ -302,4 +294,4 @@ app.get('/', (req, res) => {
 });
 
 app.listen(port, () => console.log("Hazır!"));
-                    
+                                                                                                              
